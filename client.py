@@ -1,163 +1,120 @@
 import socket
 import subprocess
-import json
 import time
-import sys
-import threading
-import logging
 import os
-from collections import deque
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Buffer settings
-JITTER_BUFFER_SIZE = 1000  # milliseconds
-MAX_PACKET_LOSS = 5  # Maximum consecutive packet loss
+import datetime
 
 
-def send_network_stats(socket, address):
-    """Send network statistics back to server"""
-    while True:
-        try:
-            data, addr = socket.recvfrom(1024)
-            if data == b'PING':
-                socket.sendto(b'PONG', addr)
-        except:
-            pass
-        time.sleep(0.1)
-
-
-def start_client(server_host, server_port):
-    """Start client to receive and play video stream"""
-    # Create UDP socket
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind to a port for receiving responses
-    client_socket.bind(('0.0.0.0', 0))
-    client_port = client_socket.getsockname()[1]
-
-    logging.info(f"Client started on port {client_port}")
+def decode_video_client():
+    # 服务器设置
+    server_host = '127.0.0.1'
+    server_port = 8888
+    stream_port = server_port + 1  # 视频流端口
 
     try:
-        # Send connection request
-        server_address = (server_host, server_port)
-        client_socket.sendto(b'CONNECT', server_address)
+        # 连接到控制socket
+        control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"连接到控制服务器 {server_host}:{server_port}...")
+        control_socket.connect((server_host, server_port))
 
-        # Start network stats thread
-        stats_thread = threading.Thread(target=send_network_stats, args=(client_socket, server_address), daemon=True)
-        stats_thread.start()
+        # 接收视频信息
+        video_info = control_socket.recv(1024).decode('utf-8').split(',')
+        if len(video_info) >= 9:
+            width, height, codec_name = video_info[0:3]
+            fps = video_info[3]
+            audio_codec, audio_sample_rate, audio_channels = video_info[4:7]
+            file_size = float(video_info[7])
+            duration = float(video_info[8])
 
-        # Receive video info
-        client_socket.settimeout(5.0)
-        data, _ = client_socket.recvfrom(4096)
-        video_info = json.loads(data.decode())
+            print(f"接收视频信息: {width}x{height}, 编解码器: {codec_name}, 帧率: {fps}fps")
+            print(f"接收音频信息: 编解码器: {audio_codec}, 采样率: {audio_sample_rate}Hz, 声道数: {audio_channels}")
+            print(f"文件大小: {file_size / 1024 / 1024:.2f} MB, 时长: {duration:.2f}秒")
 
-        logging.info(f"Received video info: {video_info}")
+            # 确认接收
+            control_socket.sendall(b'INFO_RECEIVED')
+        else:
+            print("接收到的视频信息不完整")
+            return
 
-        # Send ready signal
-        client_socket.sendto(b'READY', server_address)
+        # 告诉服务器我们准备好了
+        control_socket.sendall(b'READY')
 
-        # Create RTP socket for receiving video stream
-        rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        rtp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        rtp_port = client_port + 1
-        rtp_socket.bind(('0.0.0.0', rtp_port))
+        # 等待服务器开始信号
+        data = control_socket.recv(1024)
+        if data.decode('utf-8') == 'START':
+            print("服务器已准备就绪，开始接收视频...")
 
-        logging.info(f"Listening for RTP stream on port {rtp_port}")
+            # 使用FFplay播放流 (带声音)
+            stream_url = f'tcp://{server_host}:{stream_port}'
+            print(f"打开视频流: {stream_url}")
 
-        # Wait for stream start signal
-        data, _ = client_socket.recvfrom(1024)
+            # 记录开始时间
+            start_time = datetime.datetime.now()
+            print(f"播放开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if data == b'STREAM_STARTED':
-            logging.info("Stream is starting")
+            # 先等待一会儿，确保服务器已经开始发送
+            time.sleep(1)
 
-            # Create a temporary SDP file for FFplay
-            sdp_content = f"""v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=No Name
-c=IN IP4 {server_host}
-t=0 0
-m=video {rtp_port} RTP/AVP 96
-a=rtpmap:96 H264/90000
-a=fmtp:96 packetization-mode=1
-"""
-            sdp_file = "temp_stream.sdp"
-            with open(sdp_file, "w") as f:
-                f.write(sdp_content)
-
-            # Start FFplay with error resilience and jitter buffer
+            # 使用FFplay播放，设置高质量
             cmd = [
                 'ffplay',
-                '-protocol_whitelist', 'file,rtp,udp',
-                '-fflags', 'nobuffer',  # Reduce latency
-                '-flags', 'low_delay',
-                '-framedrop',  # Allow frame dropping for smoother playback
-                '-i', sdp_file,
-                '-probesize', '32',
-                '-analyzeduration', '0',
-                '-sync', 'ext',  # External clock sync
-                '-max_delay', str(JITTER_BUFFER_SIZE * 1000),  # Convert to microseconds
-                '-vf', 'setpts=PTS-STARTPTS',  # Reset timestamps
-                '-err_detect', 'aggressive',  # Aggressive error detection
-                '-max_error_rate', '0.5',  # Allow up to 50% errors before giving up
-                '-stats'  # Show stats
+                '-i', stream_url,
+                '-autoexit',
+                '-window_title', f'Video Stream (无损质量 {width}x{height})',
+                # 添加额外的FFplay参数以确保高质量播放
+                '-vf', f'scale={width}:{height}',  # 确保尺寸匹配
+                '-fflags', 'nobuffer',  # 减少缓冲
+                '-sync', 'audio',  # 以音频为基准同步
+                '-stats',  # 显示播放统计信息
+                '-framedrop',  # 允许丢帧以保持同步
+                '-infbuf'  # 无限缓冲区
             ]
+            print("启动FFplay: " + " ".join(cmd))
 
+            # 启动FFplay进程
+            ffplay_process = subprocess.Popen(cmd)
+
+            # 等待播放结束，但保持与控制服务器的连接
             try:
-                # Start FFplay process
-                process = subprocess.Popen(cmd)
-
-                # Monitor for stream control messages
-                while True:
+                while ffplay_process.poll() is None:
+                    # 检查是否有来自服务器的消息
+                    control_socket.settimeout(0.5)
                     try:
-                        client_socket.settimeout(1.0)
-                        data, _ = client_socket.recvfrom(1024)
-
-                        if data == b'STREAM_ENDED':
-                            logging.info("Stream ended normally")
-                            break
-                        elif data == b'STREAM_RESTARTING':
-                            logging.info("Stream is restarting with new parameters")
-                            # No need to restart FFplay, it will adapt
+                        msg = control_socket.recv(1024)
+                        if msg == b'TRANSFER_COMPLETE':
+                            print("服务器通知：传输完成")
                     except socket.timeout:
-                        # Check if FFplay is still running
-                        if process.poll() is not None:
-                            logging.error("FFplay process ended unexpectedly")
-                            break
+                        pass
+                    except Exception as e:
+                        print(f"接收服务器消息时出错: {e}")
+                        break
 
-                # Wait for FFplay to finish
-                process.wait()
-
+                    time.sleep(0.5)
             except KeyboardInterrupt:
-                logging.info("Client stopped by user")
-            except Exception as e:
-                logging.error(f"Error during playback: {e}")
+                print("用户中断播放")
             finally:
-                # Clean up
-                if 'process' in locals() and process.poll() is None:
-                    process.terminate()
-                if os.path.exists(sdp_file):
-                    os.remove(sdp_file)
-        else:
-            logging.error("Unexpected response from server")
+                # 确保FFplay进程结束
+                if ffplay_process.poll() is None:
+                    ffplay_process.terminate()
+                    ffplay_process.wait()
 
+            # 记录结束时间
+            end_time = datetime.datetime.now()
+            elapsed = (end_time - start_time).total_seconds()
+            print(f"\n播放结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"总播放时间: {elapsed:.2f}秒")
+
+    except ConnectionRefusedError:
+        print("连接被拒绝，请确保服务器正在运行")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        print(f"错误: {e}")
     finally:
-        client_socket.close()
-        if 'rtp_socket' in locals():
-            rtp_socket.close()
-        logging.info("Client closed")
+        try:
+            control_socket.close()
+        except:
+            pass
+        print("客户端关闭")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <server_host> [server_port]")
-        sys.exit(1)
-
-    server_host = sys.argv[1]
-    server_port = int(sys.argv[2]) if len(sys.argv) > 2 else 12345
-
-    start_client(server_host, server_port)
+    decode_video_client()
