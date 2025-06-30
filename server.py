@@ -79,40 +79,47 @@ class VideoServer(QuicConnectionProtocol):
                 # 客户端准备就绪，开始视频流传输
                 self._quic.send_stream_data(event.stream_id, b"START_STREAM")
                 logger.info("客户端准备就绪，开始视频流传输")
-                self.start_video_stream()
+                asyncio.create_task(self.start_video_stream(event.stream_id))
 
             elif message == "STREAM_COMPLETE":
-                # 客户端通知流传输完成
                 logger.info("客户端确认视频流传输完成")
                 if self.ffmpeg_process:
-                    self.ffmpeg_process.terminate()
+                    try:
+                        self.ffmpeg_process.terminate()
+                        self.ffmpeg_process.wait(timeout=5)
+                        logger.info("FFmpeg进程已关闭")
+                    except Exception as e:
+                        logger.error(f"关闭FFmpeg进程时出错: {e}")
 
-    def start_video_stream(self):
-        """启动FFmpeg视频流传输"""
+    async def start_video_stream(self, stream_id):
+        """通过 QUIC stream 发送视频流数据"""
         try:
             if not self.video_file_path:
                 logger.error("没有设置视频文件路径")
                 return
-                
             input_file = self.video_file_path
-            host = '127.0.0.1'
-            
-            # 使用FFmpeg进行视频流传输
             cmd = [
-                'ffmpeg', '-i', input_file,
+                'ffmpeg', '-loglevel', 'error', '-i', input_file,
                 '-f', 'mpegts',
-                '-vcodec', 'copy',  # 直接复制视频编码
-                '-acodec', 'copy',  # 直接复制音频编码
+                '-vcodec', 'copy',
+                '-acodec', 'copy',
                 '-flush_packets', '1',
-                f'tcp://{host}:{self.stream_port}?listen=1'
+                'pipe:1'
             ]
-
-            logger.info("启动FFmpeg视频流服务...")
+            logger.info("启动FFmpeg视频流服务... (pipe)")
             logger.info(" ".join(cmd))
-
-            self.ffmpeg_process = subprocess.Popen(cmd)
-            logger.info(f"FFmpeg进程已启动，PID: {self.ffmpeg_process.pid}")
-
+            self.ffmpeg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            while True:
+                chunk = self.ffmpeg_process.stdout.read(4096)
+                if not chunk:
+                    break
+                self._quic.send_stream_data(stream_id, chunk)
+            logger.info("视频流发送完毕")
+            # 推流结束后关闭进程
+            if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait(timeout=5)
+                logger.info("FFmpeg进程已关闭")
         except Exception as e:
             logger.error(f"启动视频流时出错: {e}")
 

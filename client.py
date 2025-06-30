@@ -27,49 +27,45 @@ class VideoClient(QuicConnectionProtocol):
         self._response_received = asyncio.Event()
         self.response = None
         self.video_file_path = None  # 视频文件路径
+        self.streaming = False
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
             data = event.data
+            if self.streaming:
+                if self.ffplay_process and self.ffplay_process.stdin:
+                    try:
+                        self.ffplay_process.stdin.write(data)
+                        self.ffplay_process.stdin.flush()
+                    except Exception as e:
+                        logger.error(f"写入FFplay管道时出错: {e}")
+                return
             try:
                 message = data.decode()
                 logger.info(f"收到服务器消息: {message}")
-
                 if message == "FILE_EXISTS":
-                    # 文件存在，继续请求视频信息
                     logger.info("文件存在，正在分析视频信息...")
-                    self._quic.send_stream_data(event.stream_id, b"REQUEST_VIDEO_INFO")
-
+                    ctrl_stream_id = self._quic.get_next_available_stream_id()
+                    self._quic.send_stream_data(ctrl_stream_id, b"REQUEST_VIDEO_INFO")
                 elif message == "FILE_NOT_FOUND":
-                    # 文件不存在
                     logger.error("服务器找不到指定的视频文件")
                     self._response_received.set()
-
                 elif message.startswith("VIDEO_INFO:"):
-                    # 解析视频信息
                     video_info_str = message.split(":", 1)[1]
                     self.video_info = video_info_str
                     self.parse_video_info(video_info_str)
-                    
-                    # 通知服务器我们准备接收视频流
-                    self._quic.send_stream_data(event.stream_id, b"READY_FOR_STREAM")
+                    ctrl_stream_id = self._quic.get_next_available_stream_id()
+                    self._quic.send_stream_data(ctrl_stream_id, b"READY_FOR_STREAM")
                     logger.info("已请求开始视频流传输")
-
                 elif message == "NO_VIDEO_INFO":
-                    # 没有视频信息
                     logger.error("服务器没有视频信息")
                     self._response_received.set()
-
                 elif message == "START_STREAM":
-                    # 服务器开始传输视频流
                     logger.info("服务器开始传输视频流")
+                    self.streaming = True
                     self.start_video_playback()
-
             except UnicodeDecodeError:
-                # 处理二进制数据
-                if data == b"START_STREAM":
-                    logger.info("服务器开始传输视频流")
-                    self.start_video_playback()
+                pass
 
     def set_video_file(self, file_path):
         """设置视频文件路径"""
@@ -108,56 +104,29 @@ class VideoClient(QuicConnectionProtocol):
         """启动视频播放"""
         def play_video():
             try:
-                # 等待一会儿，确保服务器已经开始发送
                 time.sleep(1)
-
-                # 构建FFplay命令
-                stream_url = f'tcp://127.0.0.1:{self.stream_port}'
-                logger.info(f"连接到视频流: {stream_url}")
-
-                # 记录开始时间
-                start_time = datetime.datetime.now()
-                logger.info(f"播放开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-                # FFplay命令参数
                 cmd = [
-                    'ffplay',
-                    '-i', stream_url,
-                    '-autoexit',
-                    '-window_title', f'QUIC Video Stream ({self.video_width}x{self.video_height})',
-                    '-vf', f'scale={self.video_width}:{self.video_height}',
+                    'ffplay', '-i', 'pipe:0',
                     '-fflags', 'nobuffer',
-                    '-sync', 'audio',
-                    '-stats',
-                    '-framedrop',
-                    '-infbuf'
+                    '-flags', 'low_delay',
+                    '-framedrop'
                 ]
-
                 logger.info("启动FFplay: " + " ".join(cmd))
-
-                # 启动FFplay进程
-                self.ffplay_process = subprocess.Popen(cmd)
-
-                # 等待播放结束
+                self.ffplay_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
                 self.ffplay_process.wait()
-
-                # 记录结束时间
-                end_time = datetime.datetime.now()
-                elapsed = (end_time - start_time).total_seconds()
-                logger.info(f"播放结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"总播放时间: {elapsed:.2f}秒")
-
-                # 通知服务器播放完成
+                # 播放结束后通知服务器
                 try:
-                    self._quic.send_stream_data(0, b"STREAM_COMPLETE")
+                    ctrl_stream_id = self._quic.get_next_available_stream_id()
+                    self._quic.send_stream_data(ctrl_stream_id, b"STREAM_COMPLETE")
                     logger.info("已通知服务器播放完成")
                 except Exception as e:
                     logger.error(f"通知服务器时出错: {e}")
-
+                # 关闭ffplay进程
+                if self.ffplay_process and self.ffplay_process.poll() is None:
+                    self.ffplay_process.terminate()
+                    self.ffplay_process.wait()
             except Exception as e:
                 logger.error(f"播放视频时出错: {e}")
-
-        # 在新线程中启动播放
         playback_thread = threading.Thread(target=play_video)
         playback_thread.daemon = True
         playback_thread.start()
