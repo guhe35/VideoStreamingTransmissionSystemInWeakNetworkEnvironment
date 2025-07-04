@@ -4,6 +4,10 @@ import ffmpeg
 import os
 import subprocess
 import datetime
+import time
+import socket
+import threading
+import random
 from aioquic.asyncio import serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -20,6 +24,20 @@ ALPN_PROTOCOLS = ["quic-demo"]
 server_running = False
 server_task = None
 
+# 网络质量等级定义
+NETWORK_QUALITY = {
+    "HIGH": {"video_bitrate": "4M", "video_scale": "854:480", "audio_bitrate": "128k"},
+    "MEDIUM": {"video_bitrate": "2M", "video_scale": "640:360", "audio_bitrate": "96k"},
+    "LOW": {"video_bitrate": "800k", "video_scale": "426:240", "audio_bitrate": "64k"},
+    "VERY_LOW": {"video_bitrate": "400k", "video_scale": "256:144", "audio_bitrate": "32k"}
+}
+
+# 网络测速结果缓存
+network_speed_cache = {"timestamp": 0, "speed": 0}
+
+# 缓冲区大小（字节）
+INITIAL_BUFFER_SIZE = 512 * 1024  # 初始缓冲区大小：512KB，与客户端保持一致
+
 
 class VideoServer(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
@@ -28,6 +46,13 @@ class VideoServer(QuicConnectionProtocol):
         self.ffmpeg_process = None
         self.stream_port = 8889  # 视频流端口
         self.video_file_path = None  # 视频文件路径
+        self.network_quality = "MEDIUM"  # 默认网络质量
+        self.current_bitrate = NETWORK_QUALITY["MEDIUM"]["video_bitrate"]
+        self.network_monitor_thread = None
+        self.stop_monitor = False
+        self.buffer = bytearray()  # 初始化缓冲区
+        self.is_streaming = False  # 流传输状态
+        self.stream_start_time = None
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
@@ -79,10 +104,20 @@ class VideoServer(QuicConnectionProtocol):
                 # 客户端准备就绪，开始视频流传输
                 self._quic.send_stream_data(event.stream_id, b"START_STREAM")
                 logger.info("客户端准备就绪，开始视频流传输")
+                
+                # 启动网络监控
+                self.stop_monitor = False
+                self.network_monitor_thread = threading.Thread(target=self.monitor_network_quality)
+                self.network_monitor_thread.daemon = True
+                self.network_monitor_thread.start()
+                
+                # 开始视频流传输
                 asyncio.create_task(self.start_video_stream(event.stream_id))
 
             elif message == "STREAM_COMPLETE":
                 logger.info("客户端确认视频流传输完成")
+                self.stop_monitor = True
+                self.is_streaming = False
                 if self.ffmpeg_process:
                     try:
                         self.ffmpeg_process.terminate()
@@ -90,6 +125,98 @@ class VideoServer(QuicConnectionProtocol):
                         logger.info("FFmpeg进程已关闭")
                     except Exception as e:
                         logger.error(f"关闭FFmpeg进程时出错: {e}")
+            
+            elif message.startswith("NETWORK_FEEDBACK:"):
+                # 接收客户端的网络反馈
+                try:
+                    feedback = message.split(":", 1)[1]
+                    quality_level = feedback.strip()
+                    if quality_level in NETWORK_QUALITY:
+                        self.network_quality = quality_level
+                        logger.info(f"根据客户端反馈调整网络质量为: {quality_level}")
+                except Exception as e:
+                    logger.error(f"处理网络反馈时出错: {e}")
+
+    def monitor_network_quality(self):
+        """监控网络质量并调整编码参数"""
+        last_quality_change_time = time.time()
+        quality_stability_period = 10  # 10秒内不再调整质量
+        
+        while not self.stop_monitor:
+            try:
+                # 测量网络速度
+                speed = self.measure_network_speed()
+                
+                # 根据网络速度调整质量
+                if speed > 8000000:  # 8 Mbps
+                    new_quality = "HIGH"
+                elif speed > 3000000:  # 3 Mbps
+                    new_quality = "MEDIUM"
+                elif speed > 1000000:  # 1 Mbps
+                    new_quality = "LOW"
+                else:
+                    new_quality = "VERY_LOW"
+                
+                current_time = time.time()
+                # 只有当质量变化且上次调整已经超过稳定期时才进行调整
+                if new_quality != self.network_quality and current_time - last_quality_change_time > quality_stability_period:
+                    logger.info(f"网络质量变化: {self.network_quality} -> {new_quality} (速度: {speed/1000000:.2f} Mbps)")
+                    self.network_quality = new_quality
+                    last_quality_change_time = current_time
+                
+                # 每5秒检测一次
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"监控网络质量时出错: {e}")
+                time.sleep(5)
+    
+    def measure_network_speed(self):
+        """测量当前网络速度"""
+        global network_speed_cache
+        
+        # 如果缓存的测速结果不超过30秒，直接使用缓存
+        current_time = time.time()
+        if current_time - network_speed_cache["timestamp"] < 30:
+            return network_speed_cache["speed"]
+        
+        try:
+            # 使用更小的测试数据，避免缓冲区溢出
+            test_size = 64 * 1024  # 64KB测试数据，减小数据包大小
+            test_data = b'0' * test_size
+            
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
+            
+            # 设置发送缓冲区大小
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            
+            # 分块发送数据，避免一次发送过多
+            chunks = 10
+            chunk_size = test_size // chunks
+            
+            start_time = time.time()
+            for i in range(chunks):
+                s.sendto(test_data[i*chunk_size:(i+1)*chunk_size], ('127.0.0.1', 12345))
+            end_time = time.time()
+            
+            s.close()
+            
+            # 计算速度 (bytes/second)
+            elapsed = end_time - start_time
+            if elapsed > 0:
+                speed = test_size / elapsed
+                
+                # 更新缓存
+                network_speed_cache = {
+                    "timestamp": current_time,
+                    "speed": speed
+                }
+                
+                return speed
+            return 2000000  # 默认2Mbps
+        except Exception as e:
+            logger.error(f"测量网络速度时出错: {e}")
+            return 2000000  # 默认2Mbps
 
     async def start_video_stream(self, stream_id):
         """通过 QUIC stream 发送视频流数据"""
@@ -97,29 +224,172 @@ class VideoServer(QuicConnectionProtocol):
             if not self.video_file_path:
                 logger.error("没有设置视频文件路径")
                 return
+                
             input_file = self.video_file_path
+            self.is_streaming = True
+            
+            # 根据网络质量选择编码参数
+            quality = NETWORK_QUALITY[self.network_quality]
+            video_bitrate = quality["video_bitrate"]
+            video_scale = quality["video_scale"]
+            audio_bitrate = quality["audio_bitrate"]
+            
+            logger.info(f"使用编码参数: 视频码率={video_bitrate}, 分辨率={video_scale}, 音频码率={audio_bitrate}")
+            
+            # 计算当前播放位置（秒）
+            current_position = 0
+            try:
+                # 估算当前播放位置
+                if hasattr(self, 'stream_start_time') and self.stream_start_time:
+                    elapsed = time.time() - self.stream_start_time
+                    current_position = max(0, elapsed - 2)  # 减去2秒缓冲时间
+                    logger.info(f"估算当前播放位置: {current_position:.2f}秒")
+            except Exception as e:
+                logger.error(f"计算播放位置时出错: {e}")
+            
+            # 启动新的FFmpeg进程，保持相同的优化参数
             cmd = [
-                'ffmpeg', '-loglevel', 'error', '-i', input_file,
+                'ffmpeg', 
+                '-loglevel', 'info',  # 增加日志级别，帮助调试
+                # 如果有播放位置，从该位置开始
+                '-ss', f"{current_position:.2f}" if current_position > 0 else "0",
+                '-i', input_file,
                 '-f', 'mpegts',
-                '-vcodec', 'copy',
-                '-acodec', 'copy',
+                '-vcodec', 'libx264', 
+                '-preset', 'ultrafast', 
+                '-tune', 'zerolatency',
+                '-b:v', video_bitrate, 
+                '-vf', f'scale={video_scale}',
+                '-pix_fmt', 'yuv420p',  # 确保使用兼容的像素格式
+                '-g', '30',  # 设置GOP大小，每30帧一个关键帧
+                '-x264-params', 'keyint=30:min-keyint=30',  # 强制关键帧间隔
+                '-acodec', 'aac', 
+                '-b:a', audio_bitrate,
+                '-ar', '48000',  # 固定音频采样率
+                '-ac', '2',      # 固定音频通道数
+                '-async', '1',   # 音频同步
+                '-vsync', '1',   # 使用简单的视频同步模式
+                '-max_muxing_queue_size', '4096',  # 增加复用队列大小
+                '-fflags', '+genpts',  # 生成PTS时间戳
+                '-flags', '+global_header',   # 添加全局头信息
                 '-flush_packets', '1',
+                '-strict', 'experimental',    # 允许实验性编码器
                 'pipe:1'
             ]
+            
             logger.info("启动FFmpeg视频流服务... (pipe)")
             logger.info(" ".join(cmd))
             self.ffmpeg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-            while True:
-                chunk = self.ffmpeg_process.stdout.read(4096)
+            
+            # 记录流开始时间
+            self.stream_start_time = time.time()
+            
+            # 定期检查网络质量并调整编码参数
+            last_quality = self.network_quality
+            
+            # 初始缓冲区填充
+            logger.info(f"正在填充初始缓冲区 ({INITIAL_BUFFER_SIZE/1024:.1f} KB)...")
+            self.buffer = bytearray()
+            
+            # 填充初始缓冲区
+            while len(self.buffer) < INITIAL_BUFFER_SIZE and self.is_streaming:
+                chunk = self.ffmpeg_process.stdout.read(8192)
                 if not chunk:
                     break
-                self._quic.send_stream_data(stream_id, chunk)
+                self.buffer.extend(chunk)
+            
+            # 确保初始缓冲区从TS同步点开始
+            if len(self.buffer) > 0:
+                # 查找MPEG-TS同步字节
+                ts_sync_byte = 0x47
+                sync_pos = -1
+                
+                for i in range(len(self.buffer)):
+                    if self.buffer[i] == ts_sync_byte:
+                        # 验证是否是有效的TS包起始位置
+                        if i + 188 <= len(self.buffer) and self.buffer[i + 188] == ts_sync_byte:
+                            sync_pos = i
+                            break
+                
+                if sync_pos > 0:
+                    logger.info(f"调整初始缓冲区到TS同步点，跳过 {sync_pos} 字节")
+                    self.buffer = self.buffer[sync_pos:]
+            
+            # 发送初始缓冲区数据
+            if self.buffer and self.is_streaming:
+                logger.info(f"发送初始缓冲区数据: {len(self.buffer)/1024:.1f} KB")
+                # 分块发送大缓冲区数据，避免一次性发送过多
+                chunk_size = 32 * 1024  # 32KB 是一个较好的数据块大小
+                for i in range(0, len(self.buffer), chunk_size):
+                    end = min(i + chunk_size, len(self.buffer))
+                    self._quic.send_stream_data(stream_id, bytes(self.buffer[i:end]))
+                    await asyncio.sleep(0.001)  # 短暂暂停，让接收方有时间处理
+                self.buffer = bytearray()  # 清空缓冲区
+                
+                # 确保数据发送后，发送一个明确的通知
+                try:
+                    notify_stream_id = self._quic.get_next_available_stream_id()
+                    self._quic.send_stream_data(notify_stream_id, b"DATA_SENT")
+                    logger.info("已发送数据通知")
+                except Exception as e:
+                    logger.error(f"发送数据通知时出错: {e}")
+            
+            # 继续发送剩余数据
+            data_count = 0
+            last_send_time = time.time()
+            read_buffer = bytearray()
+            
+            while self.is_streaming:
+                # 读取数据到缓冲区
+                chunk = self.ffmpeg_process.stdout.read(16384)  # 增加读取块大小
+                if not chunk:
+                    logger.info("FFmpeg数据流结束")
+                    break
+                
+                # 直接发送数据，不再进行TS包检查
+                try:
+                    self._quic.send_stream_data(stream_id, chunk)
+                    data_count += 1
+                    
+                    # 控制发送速率
+                    current_time = time.time()
+                    if current_time - last_send_time > 1.0:  # 每1秒记录一次
+                        logger.info(f"已发送 {data_count} 个数据包")
+                        last_send_time = current_time
+                        data_count = 0
+                        
+                    # 短暂暂停，避免发送过快导致客户端缓冲区溢出
+                    await asyncio.sleep(0.001)
+                except Exception as e:
+                    logger.error(f"发送数据时出错: {e}")
+                    break
+            
             logger.info("视频流发送完毕")
+            
+            # 发送一个明确的流结束标记，不仅仅是空数据包
+            try:
+                # 发送流结束标记
+                self._quic.send_stream_data(stream_id, b"STREAM_END_MARKER")
+                logger.info("已发送明确的流结束标记")
+                
+                # 短暂等待确保数据发送完成
+                await asyncio.sleep(0.5)
+                
+                # 再发送一个空数据包作为结束标记
+                self._quic.send_stream_data(stream_id, b"")
+                logger.info("已发送流结束标记")
+            except Exception as e:
+                logger.error(f"发送流结束标记时出错: {e}")
+            
             # 推流结束后关闭进程
             if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
                 self.ffmpeg_process.terminate()
                 self.ffmpeg_process.wait(timeout=5)
                 logger.info("FFmpeg进程已关闭")
+                
+            # 停止网络监控
+            self.stop_monitor = True
+            
         except Exception as e:
             logger.error(f"启动视频流时出错: {e}")
 
@@ -177,6 +447,11 @@ async def start_server():
     # 创建QUIC配置
     config = QuicConfiguration(is_client=False)
     config.alpn_protocols = ALPN_PROTOCOLS
+    
+    # 优化QUIC配置参数
+    config.max_data = 10 * 1024 * 1024  # 增加最大数据量
+    config.max_stream_data = 5 * 1024 * 1024  # 增加每个流的最大数据量
+    config.is_client = False
 
     # 加载证书和密钥
     config.load_cert_chain("cert.pem", "key.pem")
