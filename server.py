@@ -13,6 +13,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.events import StreamDataReceived
 
+# 导入BBR拥塞控制
+from bbr_congestion_control import BBRCongestionControl, BBRMetrics
+from quic_bbr_integration import BBRQuicProtocol, create_bbr_quic_configuration, BBRNetworkMonitor
+
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("quic-video-server")
@@ -39,7 +43,7 @@ network_speed_cache = {"timestamp": 0, "speed": 0}
 INITIAL_BUFFER_SIZE = 512 * 1024  # 初始缓冲区大小：512KB，与客户端保持一致
 
 
-class VideoServer(QuicConnectionProtocol):
+class VideoServer(BBRQuicProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.video_info = None
@@ -53,6 +57,10 @@ class VideoServer(QuicConnectionProtocol):
         self.buffer = bytearray()  # 初始化缓冲区
         self.is_streaming = False  # 流传输状态
         self.stream_start_time = None
+        
+        # BBR网络监控器 - 改进的实现
+        self.bbr_monitor = BBRNetworkMonitor()
+        self.bbr_monitor.start_monitoring(self)
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
@@ -138,31 +146,59 @@ class VideoServer(QuicConnectionProtocol):
                     logger.error(f"处理网络反馈时出错: {e}")
 
     def monitor_network_quality(self):
-        """监控网络质量并调整编码参数"""
+        """监控网络质量并调整编码参数 - 改进的实现"""
         last_quality_change_time = time.time()
         quality_stability_period = 10  # 10秒内不再调整质量
         
         while not self.stop_monitor:
             try:
-                # 测量网络速度
-                speed = self.measure_network_speed()
+                # 确保BBR已初始化
+                self._ensure_bbr_initialized()
                 
-                # 根据网络速度调整质量
-                if speed > 8000000:  # 8 Mbps
-                    new_quality = "HIGH"
-                elif speed > 3000000:  # 3 Mbps
-                    new_quality = "MEDIUM"
-                elif speed > 1000000:  # 1 Mbps
-                    new_quality = "LOW"
+                # 强制更新BBR状态（即使没有新数据）
+                if self.bbr:
+                    self.bbr.update_state()
+                
+                # 获取BBR算法指标 - 改进的指标获取
+                bbr_metrics = self.get_bbr_metrics()
+                bbr_state = self.get_bbr_state_info()
+                
+                if bbr_metrics and bbr_state:
+                    # 使用BBR带宽估算替代传统网络测速
+                    bbr_bandwidth = bbr_metrics.bandwidth
+                    bbr_rtt = bbr_metrics.rtt
+                    
+                    # 根据BBR带宽调整质量 - 改进的质量调整逻辑
+                    new_quality = self._determine_quality_from_bbr(bbr_bandwidth, bbr_rtt)
+                    
+                    current_time = time.time()
+                    # 只有当质量变化且上次调整已经超过稳定期时才进行调整
+                    if new_quality != self.network_quality and current_time - last_quality_change_time > quality_stability_period:
+                        logger.info(f"BBR网络质量变化: {self.network_quality} -> {new_quality} "
+                                  f"(BBR带宽: {bbr_bandwidth/1000000:.2f} Mbps, RTT: {bbr_rtt*1000:.2f}ms)")
+                        self.network_quality = new_quality
+                        last_quality_change_time = current_time
+                    
+                    # 记录BBR状态
+                    logger.info(f"BBR状态: {bbr_state['state']}, "
+                               f"带宽: {bbr_bandwidth/1024/1024:.2f}MB/s, "
+                               f"RTT: {bbr_rtt*1000:.2f}ms, "
+                               f"拥塞窗口: {bbr_metrics.cwnd/1024:.1f}KB, "
+                               f"在途数据: {bbr_metrics.inflight/1024:.1f}KB")
                 else:
-                    new_quality = "VERY_LOW"
-                
-                current_time = time.time()
-                # 只有当质量变化且上次调整已经超过稳定期时才进行调整
-                if new_quality != self.network_quality and current_time - last_quality_change_time > quality_stability_period:
-                    logger.info(f"网络质量变化: {self.network_quality} -> {new_quality} (速度: {speed/1000000:.2f} Mbps)")
-                    self.network_quality = new_quality
-                    last_quality_change_time = current_time
+                    logger.warning("BBR指标不可用，使用传统网络测速")
+                    # 如果BBR指标不可用，回退到传统方法
+                    speed = self.measure_network_speed()
+                    
+                    # 根据网络速度调整质量
+                    new_quality = self._determine_quality_from_speed(speed)
+                    
+                    current_time = time.time()
+                    # 只有当质量变化且上次调整已经超过稳定期时才进行调整
+                    if new_quality != self.network_quality and current_time - last_quality_change_time > quality_stability_period:
+                        logger.info(f"传统网络质量变化: {self.network_quality} -> {new_quality} (速度: {speed/1000000:.2f} Mbps)")
+                        self.network_quality = new_quality
+                        last_quality_change_time = current_time
                 
                 # 每5秒检测一次
                 time.sleep(5)
@@ -170,8 +206,48 @@ class VideoServer(QuicConnectionProtocol):
                 logger.error(f"监控网络质量时出错: {e}")
                 time.sleep(5)
     
+    def _determine_quality_from_bbr(self, bandwidth: float, rtt: float) -> str:
+        """
+        根据BBR指标确定网络质量 - 改进的质量判断逻辑
+        
+        Args:
+            bandwidth: BBR带宽 (bytes/second)
+            rtt: BBR RTT (seconds)
+            
+        Returns:
+            网络质量等级
+        """
+        # 考虑带宽和RTT的综合影响
+        if bandwidth > 8000000:  # 8 Mbps
+            return "HIGH"
+        elif bandwidth > 3000000:  # 3 Mbps
+            return "MEDIUM"
+        elif bandwidth > 1000000:  # 1 Mbps
+            return "LOW"
+        else:
+            return "VERY_LOW"
+    
+    def _determine_quality_from_speed(self, speed: float) -> str:
+        """
+        根据传统网络测速确定网络质量
+        
+        Args:
+            speed: 网络速度 (bytes/second)
+            
+        Returns:
+            网络质量等级
+        """
+        if speed > 8000000:  # 8 Mbps
+            return "HIGH"
+        elif speed > 3000000:  # 3 Mbps
+            return "MEDIUM"
+        elif speed > 1000000:  # 1 Mbps
+            return "LOW"
+        else:
+            return "VERY_LOW"
+    
     def measure_network_speed(self):
-        """测量当前网络速度"""
+        """测量当前网络速度 - 改进的实现"""
         global network_speed_cache
         
         # 如果缓存的测速结果不超过30秒，直接使用缓存
@@ -219,7 +295,7 @@ class VideoServer(QuicConnectionProtocol):
             return 2000000  # 默认2Mbps
 
     async def start_video_stream(self, stream_id):
-        """通过 QUIC stream 发送视频流数据"""
+        """通过 QUIC stream 发送视频流数据 - 改进的实现"""
         try:
             if not self.video_file_path:
                 logger.error("没有设置视频文件路径")
@@ -349,6 +425,11 @@ class VideoServer(QuicConnectionProtocol):
                 # 直接发送数据，不再进行TS包检查
                 try:
                     self._quic.send_stream_data(stream_id, chunk)
+                    
+                    # 更新BBR算法（基于发送的数据）
+                    if len(chunk) > 0:
+                        self.update_bbr_from_data(len(chunk))
+                    
                     data_count += 1
                     
                     # 控制发送速率
@@ -392,6 +473,38 @@ class VideoServer(QuicConnectionProtocol):
             
         except Exception as e:
             logger.error(f"启动视频流时出错: {e}")
+
+    def cleanup(self):
+        """清理服务器端资源 - 改进的实现"""
+        logger.info("正在清理VideoServer资源...")
+        
+        # 停止监控
+        self.stop_monitor = True
+        
+        # 停止网络监控线程
+        if self.network_monitor_thread and self.network_monitor_thread.is_alive():
+            self.network_monitor_thread.join(timeout=1)
+        
+        # 停止BBR监控
+        if self.bbr_monitor:
+            self.bbr_monitor.stop_monitoring()
+        
+        # 关闭ffmpeg进程
+        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+            try:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait(timeout=2)
+            except:
+                try:
+                    self.ffmpeg_process.kill()
+                except:
+                    pass
+        
+        # 重置状态
+        self.is_streaming = False
+        self.stream_start_time = None
+        
+        logger.info("VideoServer资源清理完成")
 
 
 async def analyze_video(input_file):
@@ -441,22 +554,17 @@ async def analyze_video(input_file):
 
 
 async def start_server():
-    """启动服务器的函数，可以被其他程序调用"""
+    """启动服务器的函数，可以被其他程序调用 - 改进的实现"""
     global server_running, server_task
 
-    # 创建QUIC配置
-    config = QuicConfiguration(is_client=False)
-    config.alpn_protocols = ALPN_PROTOCOLS
-    
-    # 优化QUIC配置参数
-    config.max_data = 10 * 1024 * 1024  # 增加最大数据量
-    config.max_stream_data = 5 * 1024 * 1024  # 增加每个流的最大数据量
+    # 创建BBR QUIC配置
+    config = create_bbr_quic_configuration()
     config.is_client = False
 
     # 加载证书和密钥
     config.load_cert_chain("cert.pem", "key.pem")
 
-    # 创建服务器实例
+    # 创建BBR服务器实例
     def create_protocol(*args, **kwargs):
         protocol = VideoServer(*args, **kwargs)
         return protocol
@@ -469,7 +577,7 @@ async def start_server():
         create_protocol=create_protocol
     )
 
-    logger.info(f"QUIC视频服务器已启动，监听端口4433，支持的ALPN协议: {ALPN_PROTOCOLS}")
+    logger.info(f"BBR QUIC视频服务器已启动，监听端口4433，支持的ALPN协议: {ALPN_PROTOCOLS}")
     logger.info("等待客户端连接...")
     
     server_running = True

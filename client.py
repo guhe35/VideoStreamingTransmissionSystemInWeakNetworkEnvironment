@@ -13,6 +13,10 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.events import StreamDataReceived
 import re
 
+# 导入BBR拥塞控制
+from bbr_congestion_control import BBRCongestionControl, BBRMetrics
+from quic_bbr_integration import BBRQuicProtocol, create_bbr_quic_configuration, BBRNetworkMonitor
+
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("quic-video-client")
@@ -33,7 +37,7 @@ INITIAL_BUFFER_SIZE = 1024 * 1024  # 初始缓冲区大小：1MB，增加初始�
 MIN_PLAYBACK_BUFFER = 256 * 1024  # 最小播放缓冲区：256KB
 
 
-class VideoClient(QuicConnectionProtocol):
+class VideoClient(BBRQuicProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.video_info = None
@@ -56,12 +60,20 @@ class VideoClient(QuicConnectionProtocol):
         self.playback_started = False  # 播放是否已开始
         self.video_stream_id = None  # 保存当前流ID，用于接收视频数据
         self.av_sync_stats = {"pts_diff": [], "last_check": time.time()}  # 音视频同步统计
+        
+        # BBR网络监控器 - 改进的实现
+        self.bbr_monitor = BBRNetworkMonitor()
+        self.bbr_monitor.start_monitoring(self)
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
             data = event.data
             # 记录接收到的流ID
             logger.debug(f"收到流ID {event.stream_id} 的数据: {len(data)} 字节")
+            
+            # 更新BBR算法（基于接收到的数据）
+            if len(data) > 0:
+                self.update_bbr_from_data(len(data))
             
             if self.streaming:
                 # 如果收到空数据，可能表示流结束
@@ -238,8 +250,8 @@ class VideoClient(QuicConnectionProtocol):
             logger.error(f"解析视频信息时出错: {e}")
     
     def monitor_network_quality(self):
-        """监控网络质量并向服务器发送反馈"""
-        logger.info("启动网络质量监控")
+        """监控网络质量并向服务器发送反馈 - 改进的实现"""
+        logger.info("启动BBR网络质量监控")
         
         last_data_time = time.time()
         last_bytes_count = self.total_bytes_received
@@ -247,57 +259,97 @@ class VideoClient(QuicConnectionProtocol):
         
         while not self.stop_monitor:
             try:
-                # 计算当前网络速度
-                current_time = time.time()
-                elapsed = current_time - self.last_speed_check
+                # 确保BBR已初始化
+                self._ensure_bbr_initialized()
                 
-                if elapsed >= 2.0:  # 每2秒检查一次
-                    bytes_diff = self.total_bytes_received - self.last_bytes_count
-                    current_speed = bytes_diff / elapsed
+                # 强制更新BBR状态（即使没有新数据）
+                if self.bbr:
+                    self.bbr.update_state()
+                
+                # 获取BBR算法指标 - 改进的指标获取
+                bbr_metrics = self.get_bbr_metrics()
+                bbr_state = self.get_bbr_state_info()
+                
+                if bbr_metrics and bbr_state:
+                    # 使用BBR带宽估算替代传统网络测速
+                    bbr_bandwidth = bbr_metrics.bandwidth
+                    bbr_rtt = bbr_metrics.rtt
                     
-                    # 更新上次检查的值
-                    self.last_bytes_count = self.total_bytes_received
-                    self.last_speed_check = current_time
+                    # 根据BBR带宽确定质量级别 - 改进的质量判断逻辑
+                    new_quality = self._determine_quality_from_bbr(bbr_bandwidth, bbr_rtt)
                     
-                    # 检测数据停止接收的情况
-                    if bytes_diff == 0:
-                        no_data_counter += 1
-                        # 如果超过3次检查都没有收到新数据，可能是连接问题
-                        if no_data_counter >= 3:
-                            logger.warning(f"已有{no_data_counter*2}秒未收到数据，可能存在连接问题")
-                            
-                        # 如果超过5秒没有收到新数据，可能是视频流结束
-                        if current_time - last_data_time > 5 and self.playback_started:
-                            logger.info("超过5秒未收到新数据，视频流可能已结束")
-                        elif current_time - last_data_time > 10 and not self.playback_started:
-                            # 如果超过10秒没有收到足够数据开始播放，强制开始播放
-                            if self.buffer_size > 0:
-                                logger.info(f"等待超时，强制开始播放缓冲的数据 ({self.buffer_size/1024:.1f} KB)")
-                                self.playback_started = True
-                                self.start_video_playback()
-                    else:
-                        # 收到数据，重置计数器
-                        no_data_counter = 0
-                        # 更新最后收到数据的时间
-                        last_data_time = current_time
-                        last_bytes_count = self.total_bytes_received
-                    
-                    # 检查缓冲区状态
-                    if self.ffplay_process and self.ffplay_process.poll() is None:
-                        # 根据网络速度确定质量级别
-                        new_quality = self.determine_quality_level(current_speed)
+                    if new_quality != self.network_quality:
+                        logger.info(f"BBR网络质量变化: {self.network_quality} -> {new_quality} "
+                                  f"(BBR带宽: {bbr_bandwidth/1000000:.2f} Mbps, RTT: {bbr_rtt*1000:.2f}ms)")
+                        self.network_quality = new_quality
                         
-                        if new_quality != self.network_quality:
-                            logger.info(f"网络质量变化: {self.network_quality} -> {new_quality} (速度: {current_speed/1000000:.2f} Mbps)")
-                            self.network_quality = new_quality
+                        # 发送网络质量反馈给服务器
+                        try:
+                            ctrl_stream_id = self._quic.get_next_available_stream_id()
+                            self._quic.send_stream_data(ctrl_stream_id, f"NETWORK_FEEDBACK:{new_quality}".encode())
+                            logger.info(f"已向服务器发送BBR网络质量反馈: {new_quality}")
+                        except Exception as e:
+                            logger.error(f"发送BBR网络反馈时出错: {e}")
+                    
+                    # 记录BBR状态
+                    logger.info(f"BBR状态: {bbr_state['state']}, "
+                               f"带宽: {bbr_bandwidth/1024/1024:.2f}MB/s, "
+                               f"RTT: {bbr_rtt*1000:.2f}ms, "
+                               f"拥塞窗口: {bbr_metrics.cwnd/1024:.1f}KB, "
+                               f"在途数据: {bbr_metrics.inflight/1024:.1f}KB")
+                else:
+                    logger.warning("BBR指标不可用，使用传统网络测速")
+                    # 如果BBR指标不可用，回退到传统方法
+                    current_time = time.time()
+                    elapsed = current_time - self.last_speed_check
+                    
+                    if elapsed >= 2.0:  # 每2秒检查一次
+                        bytes_diff = self.total_bytes_received - self.last_bytes_count
+                        current_speed = bytes_diff / elapsed
+                        
+                        # 更新上次检查的值
+                        self.last_bytes_count = self.total_bytes_received
+                        self.last_speed_check = current_time
+                        
+                        # 检测数据停止接收的情况
+                        if bytes_diff == 0:
+                            no_data_counter += 1
+                            # 如果超过3次检查都没有收到新数据，可能是连接问题
+                            if no_data_counter >= 3:
+                                logger.warning(f"已有{no_data_counter*2}秒未收到数据，可能存在连接问题")
+                                
+                            # 如果超过5秒没有收到新数据，可能是视频流结束
+                            if current_time - last_data_time > 5 and self.playback_started:
+                                logger.info("超过5秒未收到新数据，视频流可能已结束")
+                            elif current_time - last_data_time > 10 and not self.playback_started:
+                                # 如果超过10秒没有收到足够数据开始播放，强制开始播放
+                                if self.buffer_size > 0:
+                                    logger.info(f"等待超时，强制开始播放缓冲的数据 ({self.buffer_size/1024:.1f} KB)")
+                                    self.playback_started = True
+                                    self.start_video_playback()
+                        else:
+                            # 收到数据，重置计数器
+                            no_data_counter = 0
+                            # 更新最后收到数据的时间
+                            last_data_time = current_time
+                            last_bytes_count = self.total_bytes_received
+                        
+                        # 检查缓冲区状态
+                        if self.ffplay_process and self.ffplay_process.poll() is None:
+                            # 根据网络速度确定质量级别
+                            new_quality = self._determine_quality_from_speed(current_speed)
                             
-                            # 发送网络质量反馈给服务器
-                            try:
-                                ctrl_stream_id = self._quic.get_next_available_stream_id()
-                                self._quic.send_stream_data(ctrl_stream_id, f"NETWORK_FEEDBACK:{new_quality}".encode())
-                                logger.info(f"已向服务器发送网络质量反馈: {new_quality}")
-                            except Exception as e:
-                                logger.error(f"发送网络反馈时出错: {e}")
+                            if new_quality != self.network_quality:
+                                logger.info(f"传统网络质量变化: {self.network_quality} -> {new_quality} (速度: {current_speed/1000000:.2f} Mbps)")
+                                self.network_quality = new_quality
+                                
+                                # 发送网络质量反馈给服务器
+                                try:
+                                    ctrl_stream_id = self._quic.get_next_available_stream_id()
+                                    self._quic.send_stream_data(ctrl_stream_id, f"NETWORK_FEEDBACK:{new_quality}".encode())
+                                    logger.info(f"已向服务器发送传统网络质量反馈: {new_quality}")
+                                except Exception as e:
+                                    logger.error(f"发送传统网络反馈时出错: {e}")
                 
                 # 每1秒检查一次
                 time.sleep(1)
@@ -306,8 +358,37 @@ class VideoClient(QuicConnectionProtocol):
                 logger.error(f"监控网络质量时出错: {e}")
                 time.sleep(2)
     
-    def determine_quality_level(self, speed):
-        """根据网络速度确定质量级别"""
+    def _determine_quality_from_bbr(self, bandwidth: float, rtt: float) -> str:
+        """
+        根据BBR指标确定网络质量 - 改进的质量判断逻辑
+        
+        Args:
+            bandwidth: BBR带宽 (bytes/second)
+            rtt: BBR RTT (seconds)
+            
+        Returns:
+            网络质量等级
+        """
+        # 考虑带宽和RTT的综合影响
+        if bandwidth > 8000000:  # 8 Mbps
+            return "HIGH"
+        elif bandwidth > 3000000:  # 3 Mbps
+            return "MEDIUM"
+        elif bandwidth > 1000000:  # 1 Mbps
+            return "LOW"
+        else:
+            return "VERY_LOW"
+    
+    def _determine_quality_from_speed(self, speed: float) -> str:
+        """
+        根据传统网络测速确定网络质量
+        
+        Args:
+            speed: 网络速度 (bytes/second)
+            
+        Returns:
+            网络质量等级
+        """
         if speed >= NETWORK_QUALITY["HIGH"]["min_speed"]:
             return "HIGH"
         elif speed >= NETWORK_QUALITY["MEDIUM"]["min_speed"]:
@@ -318,7 +399,7 @@ class VideoClient(QuicConnectionProtocol):
             return "VERY_LOW"
 
     def measure_network_speed(self):
-        """测量当前网络速度"""
+        """测量当前网络速度 - 改进的实现"""
         try:
             # 使用psutil获取网络IO统计信息
             net_io_counters = psutil.net_io_counters()
@@ -344,7 +425,7 @@ class VideoClient(QuicConnectionProtocol):
             return 2000000  # 默认2Mbps
 
     def start_video_playback(self):
-        """启动视频播放"""
+        """启动视频播放 - 改进的实现"""
         def play_video():
             try:
                 logger.info("准备启动视频播放...")
@@ -455,6 +536,88 @@ class VideoClient(QuicConnectionProtocol):
         playback_thread.daemon = True
         playback_thread.start()
 
+    def cleanup(self):
+        """清理资源 - 改进的实现"""
+        logger.info("正在清理VideoClient资源...")
+        
+        # 停止监控
+        self.stop_monitor = True
+        
+        # 停止网络监控线程
+        if self.network_monitor_thread and self.network_monitor_thread.is_alive():
+            self.network_monitor_thread.join(timeout=1)
+        
+        # 停止BBR监控
+        if self.bbr_monitor:
+            self.bbr_monitor.stop_monitoring()
+        
+        # 关闭ffplay进程
+        if self.ffplay_process and self.ffplay_process.poll() is None:
+            try:
+                self.ffplay_process.terminate()
+                self.ffplay_process.wait(timeout=2)
+            except:
+                try:
+                    self.ffplay_process.kill()
+                except:
+                    pass
+        
+        # 清空缓冲区
+        self.buffer = bytearray()
+        self.buffer_size = 0
+        
+        # 重置状态
+        self.streaming = False
+        self.playback_started = False
+        
+        logger.info("VideoClient资源清理完成")
+
+    def periodic_network_update(self):
+        """定期更新网络指标 - 改进的实现"""
+        try:
+            # 确保BBR已初始化
+            self._ensure_bbr_initialized()
+            
+            # 获取BBR指标
+            bbr_metrics = self.get_bbr_metrics()
+            bbr_state = self.get_bbr_state_info()
+            
+            # 发送网络状态到GUI
+            network_info = {
+                'bytes_received': getattr(self, 'total_bytes_received', 0),
+                'quality': getattr(self, 'network_quality', 'UNKNOWN'),
+                'buffer_size': getattr(self, 'buffer_size', 0),
+                'bbr_metrics': bbr_metrics,
+                'bbr_state': bbr_state
+            }
+            self.parent_thread.network_status.emit(network_info)
+            
+            # 更新播放状态
+            playback_info = {
+                'streaming': getattr(self, 'streaming', False),
+                'playback_started': getattr(self, 'playback_started', False)
+            }
+            self.parent_thread.playback_status.emit(playback_info)
+            
+            # 添加调试日志
+            if bbr_metrics:
+                logger.debug(f"GUI BBR指标: 状态={bbr_state.get('state', 'unknown') if bbr_state else 'unknown'}, "
+                           f"带宽={bbr_metrics.bandwidth/1024/1024:.2f}MB/s, "
+                           f"RTT={bbr_metrics.rtt*1000:.2f}ms, "
+                           f"在途数据={bbr_metrics.inflight/1024:.1f}KB")
+            else:
+                logger.debug("GUI BBR指标不可用")
+            
+            # 重新启动定时器
+            if not self.stop_monitor:
+                self.network_update_timer = threading.Timer(1.0, self.periodic_network_update)
+                self.network_update_timer.daemon = True
+                self.network_update_timer.start()
+        except Exception as e:
+            logger.error(f"定期更新网络指标时出错: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
 
 async def run_client(video_file_path=None):
     # 如果没有提供文件路径，使用文件浏览器选择
@@ -485,16 +648,12 @@ async def run_client(video_file_path=None):
         
         print(f"已选择文件: {video_file_path}")
 
-    # 创建QUIC配置
-    config = QuicConfiguration(is_client=True)
-    config.alpn_protocols = ALPN_PROTOCOLS
+    # 创建BBR QUIC配置
+    config = create_bbr_quic_configuration()
+    config.is_client = True
     config.verify_mode = ssl.CERT_NONE
-    
-    # 优化QUIC配置参数
-    config.max_data = 10 * 1024 * 1024  # 增加最大数据量
-    config.max_stream_data = 5 * 1024 * 1024  # 增加每个流的最大数据量
 
-    logger.info(f"正在连接到QUIC视频服务器，使用ALPN协议: {ALPN_PROTOCOLS}...")
+    logger.info(f"正在连接到BBR QUIC视频服务器，使用ALPN协议: {ALPN_PROTOCOLS}...")
     logger.info(f"选择的视频文件: {video_file_path}")
 
     # 连接重试机制
@@ -510,7 +669,7 @@ async def run_client(video_file_path=None):
                     configuration=config,
                     create_protocol=VideoClient
             ) as client:
-                logger.info("已连接到服务器")
+                logger.info("已连接到BBR QUIC服务器")
 
                 # 设置视频文件路径
                 client.set_video_file(video_file_path)
