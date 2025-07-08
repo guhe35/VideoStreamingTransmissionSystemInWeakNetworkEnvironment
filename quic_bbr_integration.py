@@ -34,6 +34,16 @@ class BBRQuicConnection(QuicConnection):
         self.delivered_packets = {}  # 已传输的数据包跟踪
         self.next_packet_id = 0
         
+        # Pacing机制 - 改进的实现
+        self.pacing_timer = None
+        self.pacing_queue = []
+        self.last_pacing_time = time.time()
+        self.pacing_enabled = True
+        
+        # 拥塞控制参数应用 - 改进的实现
+        self.applied_cwnd = 10 * 1024  # 当前应用的拥塞窗口
+        self.applied_pacing_rate = 1.25e6  # 当前应用的发送速率
+        
         # 定期更新BBR状态
         self.bbr_update_task = None
         
@@ -42,6 +52,62 @@ class BBRQuicConnection(QuicConnection):
     def _send_datagram(self, data: bytes, addr: tuple) -> None:
         """
         重写发送数据报方法，集成BBR拥塞控制 - 改进的实现
+        """
+        # 检查拥塞窗口限制
+        if self.inflight >= self.applied_cwnd:
+            logger.debug(f"拥塞窗口限制: inflight={self.inflight}, cwnd={self.applied_cwnd}")
+            return
+        
+        # 应用Pacing机制
+        if self.pacing_enabled:
+            self._apply_pacing(data, addr)
+        else:
+            self._send_immediate(data, addr)
+    
+    def _apply_pacing(self, data: bytes, addr: tuple):
+        """
+        应用Pacing机制 - 新增
+        
+        Args:
+            data: 要发送的数据
+            addr: 目标地址
+        """
+        current_time = time.time()
+        
+        # 计算下一个发送时间
+        if self.applied_pacing_rate > 0:
+            packet_size = len(data)
+            pacing_delay = packet_size / self.applied_pacing_rate
+            
+            # 确保最小间隔
+            min_delay = 0.001  # 1ms最小间隔
+            pacing_delay = max(pacing_delay, min_delay)
+            
+            next_send_time = self.last_pacing_time + pacing_delay
+            
+            if current_time >= next_send_time:
+                # 立即发送
+                self._send_immediate(data, addr)
+                self.last_pacing_time = current_time
+            else:
+                # 延迟发送
+                delay = next_send_time - current_time
+                self.pacing_queue.append((data, addr, next_send_time))
+                
+                # 启动定时器
+                if self.pacing_timer is None or self.pacing_timer.done():
+                    self.pacing_timer = asyncio.create_task(self._pacing_timer())
+        else:
+            # Pacing禁用，立即发送
+            self._send_immediate(data, addr)
+    
+    def _send_immediate(self, data: bytes, addr: tuple):
+        """
+        立即发送数据包 - 新增
+        
+        Args:
+            data: 要发送的数据
+            addr: 目标地址
         """
         # 记录发送的数据包
         packet_id = self.next_packet_id
@@ -57,10 +123,47 @@ class BBRQuicConnection(QuicConnection):
         
         # 通知BBR算法数据包发送
         self.bbr.on_packet_sent(len(data))
+        
+        # 更新在途数据量
+        self.inflight += len(data)
+        
         logger.debug(f"QUIC发送数据包: {len(data)} bytes, 地址: {addr}")
         
         # 调用原始发送方法
         super()._send_datagram(data, addr)
+    
+    async def _pacing_timer(self):
+        """
+        Pacing定时器 - 新增
+        """
+        try:
+            while self.pacing_queue:
+                current_time = time.time()
+                
+                # 检查队列中可发送的数据包
+                ready_packets = []
+                remaining_packets = []
+                
+                for data, addr, send_time in self.pacing_queue:
+                    if current_time >= send_time:
+                        ready_packets.append((data, addr))
+                    else:
+                        remaining_packets.append((data, addr, send_time))
+                
+                # 发送准备好的数据包
+                for data, addr in ready_packets:
+                    self._send_immediate(data, addr)
+                
+                # 更新队列
+                self.pacing_queue = remaining_packets
+                
+                # 等待一段时间
+                await asyncio.sleep(0.001)  # 1ms
+                
+        except asyncio.CancelledError:
+            logger.debug("Pacing定时器已取消")
+        except Exception as e:
+            logger.error(f"Pacing定时器出错: {e}")
     
     def _handle_ack_frame(self, frame_type: int, buf: bytes) -> None:
         """
@@ -104,6 +207,10 @@ class BBRQuicConnection(QuicConnection):
             
             # 通知BBR算法数据包传输完成
             self.bbr.on_packet_delivered(packet_size, delivery_rtt)
+            
+            # 更新在途数据量
+            self.inflight = max(0, self.inflight - packet_size)
+            
             logger.debug(f"QUIC ACK处理: 数据包大小 {packet_size} bytes, RTT {delivery_rtt*1000:.2f}ms")
         
         # 定期记录BBR指标
@@ -151,6 +258,10 @@ class BBRQuicConnection(QuicConnection):
             new_pacing_rate: 新的发送速率
         """
         try:
+            # 更新应用的参数
+            self.applied_cwnd = new_cwnd
+            self.applied_pacing_rate = new_pacing_rate
+            
             # 尝试更新QUIC内部的拥塞控制参数
             if hasattr(self, '_loss'):
                 # 更新拥塞窗口

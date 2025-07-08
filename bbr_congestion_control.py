@@ -34,7 +34,7 @@ class BBRCongestionControl:
     """
     BBR (Bottleneck Bandwidth and Round-trip propagation time) 拥塞控制算法实现
     
-    基于BBR v1论文的改进实现，包含完整的BBR状态机和参数管理
+    基于BBR v1论文的完整实现，包含完整的BBR状态机和参数管理
     """
     
     def __init__(self, initial_cwnd: int = 10 * 1024, initial_pacing_rate: float = 1.25e6):
@@ -60,6 +60,12 @@ class BBRCongestionControl:
         self.min_rtt = float('inf') # 最小RTT
         self.rtt = 0.0             # 当前RTT
         
+        # Round概念 - 改进的实现
+        self.round_count = 0
+        self.round_start_time = time.time()
+        self.round_trip_count = 0
+        self.next_round_delivered = 0
+        
         # 带宽估算 - 改进的实现
         self.delivery_rate = 0.0   # 传输速率
         self.max_bandwidth = 0.0   # 最大带宽
@@ -68,11 +74,17 @@ class BBRCongestionControl:
         self.bandwidth_window_start = time.time()
         self.bandwidth_window_size = 10  # 带宽测量窗口大小 (rounds)
         
+        # 带宽衰减机制 - 新增
+        self.bandwidth_decay_factor = 0.95  # 带宽衰减因子
+        self.last_bandwidth_decay = time.time()
+        self.bandwidth_decay_interval = 10.0  # 带宽衰减间隔 (seconds)
+        
         # RTT估算 - 改进的实现
         self.rtt_samples = []      # RTT样本
         self.max_rtt_samples = 10  # 最大RTT样本数
         self.rtt_window_start = time.time()
         self.rtt_window_size = 10  # RTT测量窗口大小 (rounds)
+        self.rtt_window_len = 10.0  # RTT窗口长度 (seconds)
         
         # 探测参数 - 按照BBR论文标准
         self.probe_bw_cycle = 0    # 带宽探测周期
@@ -93,7 +105,6 @@ class BBRCongestionControl:
         self.cwnd_gains = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]       # 8周期拥塞窗口增益
         
         # 统计信息
-        self.round_count = 0
         self.packet_count = 0
         self.bytes_sent = 0
         self.bytes_delivered = 0
@@ -110,7 +121,32 @@ class BBRCongestionControl:
         self.delivered_packets = {}  # 已传输的数据包跟踪
         self.next_packet_id = 0
         
+        # Pacing机制 - 新增
+        self.pacing_timer = None
+        self.pacing_queue = []
+        self.last_pacing_time = time.time()
+        
         logger.info("BBR拥塞控制算法初始化完成")
+    
+    def update_round_counter(self, delivered: int):
+        """
+        更新Round计数器 - 新增
+        
+        Args:
+            delivered: 本次传输的字节数
+        """
+        self.bytes_delivered += delivered
+        
+        # 检查是否完成一个round
+        if self.bytes_delivered >= self.next_round_delivered:
+            self.round_count += 1
+            self.round_trip_count += 1
+            self.next_round_delivered = self.bytes_delivered + self.btl_bw * self.rt_prop
+            
+            # 更新round开始时间
+            self.round_start_time = time.time()
+            
+            logger.debug(f"BBR Round完成: {self.round_count}, 传输字节: {delivered}")
     
     def update_bandwidth(self, delivered_bytes: int, delivered_time: float):
         """
@@ -141,7 +177,27 @@ class BBRCongestionControl:
             self.btl_bw = self.max_bandwidth
             logger.info(f"BBR最大带宽更新: {self.btl_bw/1024/1024:.2f} MB/s")
         
+        # 带宽衰减机制 - 新增
+        self._apply_bandwidth_decay()
+        
         self.last_bandwidth_update = time.time()
+    
+    def _apply_bandwidth_decay(self):
+        """
+        应用带宽衰减机制 - 新增
+        """
+        current_time = time.time()
+        if current_time - self.last_bandwidth_decay > self.bandwidth_decay_interval:
+            # 应用带宽衰减
+            self.btl_bw *= self.bandwidth_decay_factor
+            self.max_bandwidth *= self.bandwidth_decay_factor
+            
+            # 更新带宽样本
+            if self.bandwidth_samples:
+                self.bandwidth_samples = [rate * self.bandwidth_decay_factor for rate in self.bandwidth_samples]
+            
+            self.last_bandwidth_decay = current_time
+            logger.debug(f"BBR带宽衰减应用: 新带宽 {self.btl_bw/1024/1024:.2f} MB/s")
     
     def update_rtt(self, rtt: float):
         """
@@ -159,6 +215,14 @@ class BBRCongestionControl:
         self.rtt_samples.append(rtt)
         if len(self.rtt_samples) > self.max_rtt_samples:
             self.rtt_samples.pop(0)
+        
+        # RTT窗口机制 - 新增
+        current_time = time.time()
+        if current_time - self.rtt_window_start > self.rtt_window_len:
+            # 重置RTT窗口
+            self.rtt_samples.clear()
+            self.rtt_window_start = current_time
+            logger.debug("BBR RTT窗口重置")
         
         # 更新最小RTT - 这是BBR的核心
         if rtt < self.min_rtt:
@@ -359,6 +423,9 @@ class BBRCongestionControl:
         self.inflight = max(0, self.inflight - packet_size)
         self.update_rtt(rtt)
         
+        # 更新Round计数器
+        self.update_round_counter(packet_size)
+        
         # 更新带宽估算
         current_time = time.time()
         if self.last_bandwidth_update > 0:
@@ -459,5 +526,8 @@ class BBRCongestionControl:
         self.sent_packets.clear()
         self.delivered_packets.clear()
         self.next_packet_id = 0
+        self.round_count = 0
+        self.round_trip_count = 0
+        self.next_round_delivered = 0
         
         logger.info("BBR算法状态已重置") 

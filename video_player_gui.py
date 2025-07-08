@@ -20,7 +20,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'test'))
 from server import start_server, stop_server, VideoServer, analyze_video, NETWORK_QUALITY
 from client import VideoClient, ALPN_PROTOCOLS
 
-# 导入BBR拥塞控制
+# 导入网络监控模块
 from bbr_congestion_control import BBRMetrics
 from quic_bbr_integration import BBRNetworkMonitor
 
@@ -207,20 +207,14 @@ class ClientThread(QThread):
                     def periodic_network_update(self):
                         """定期更新网络指标 - 改进的实现"""
                         try:
-                            # 确保BBR已初始化
-                            self._ensure_bbr_initialized()
-                            
-                            # 获取BBR指标
+                            # 获取算法指标（后台使用，不显示在GUI）
                             bbr_metrics = self.get_bbr_metrics()
-                            bbr_state = self.get_bbr_state_info()
                             
                             # 发送网络状态到GUI
                             network_info = {
                                 'bytes_received': getattr(self, 'total_bytes_received', 0),
                                 'quality': getattr(self, 'network_quality', 'UNKNOWN'),
-                                'buffer_size': getattr(self, 'buffer_size', 0),
-                                'bbr_metrics': bbr_metrics,
-                                'bbr_state': bbr_state
+                                'buffer_size': getattr(self, 'buffer_size', 0)
                             }
                             self.parent_thread.network_status.emit(network_info)
                             
@@ -230,15 +224,6 @@ class ClientThread(QThread):
                                 'playback_started': getattr(self, 'playback_started', False)
                             }
                             self.parent_thread.playback_status.emit(playback_info)
-                            
-                            # 添加调试日志
-                            if bbr_metrics:
-                                logger.debug(f"GUI BBR指标: 状态={bbr_state.get('state', 'unknown') if bbr_state else 'unknown'}, "
-                                           f"带宽={bbr_metrics.bandwidth/1024/1024:.2f}MB/s, "
-                                           f"RTT={bbr_metrics.rtt*1000:.2f}ms, "
-                                           f"在途数据={bbr_metrics.inflight/1024:.1f}KB")
-                            else:
-                                logger.debug("GUI BBR指标不可用")
                             
                             # 重新启动定时器
                             if not self.stop_monitor:
@@ -309,17 +294,11 @@ class ClientThread(QThread):
                         
                         # 更新网络状态
                         if hasattr(client, 'total_bytes_received') and hasattr(client, 'network_quality'):
-                            # 获取BBR指标
-                            bbr_metrics = client.get_bbr_metrics()
-                            bbr_state = client.get_bbr_state_info()
-                            
                             # 获取QUIC连接统计信息
                             network_info = {
                                 'bytes_received': client.total_bytes_received,
                                 'quality': client.network_quality,
-                                'buffer_size': getattr(client, 'buffer_size', 0),
-                                'bbr_metrics': bbr_metrics,
-                                'bbr_state': bbr_state
+                                'buffer_size': getattr(client, 'buffer_size', 0)
                             }
                             self.network_status.emit(network_info)
                         
@@ -407,7 +386,7 @@ class VideoPlayerGUI(QMainWindow):
         QTimer.singleShot(500, self.start_server)  # 延迟500毫秒启动服务器，确保UI已完全加载
     
     def init_ui(self):
-        self.setWindowTitle('QUIC视频播放器 - BBR优化版')
+        self.setWindowTitle('QUIC视频播放器')
         self.setGeometry(100, 100, 900, 700)
         
         # 创建主布局
@@ -485,29 +464,6 @@ class VideoPlayerGUI(QMainWindow):
         self.buffer_progress.setValue(0)
         network_layout.addWidget(self.buffer_progress)
         
-        # BBR算法状态显示 - 改进的显示
-        self.bbr_state_label = QLabel("BBR状态: -")
-        network_layout.addWidget(self.bbr_state_label)
-        
-        self.bbr_bandwidth_label = QLabel("BBR带宽: - MB/s")
-        network_layout.addWidget(self.bbr_bandwidth_label)
-        
-        self.bbr_rtt_label = QLabel("BBR RTT: - ms")
-        network_layout.addWidget(self.bbr_rtt_label)
-        
-        self.bbr_cwnd_label = QLabel("BBR拥塞窗口: - KB")
-        network_layout.addWidget(self.bbr_cwnd_label)
-        
-        # 新增BBR指标显示
-        self.bbr_inflight_label = QLabel("BBR在途数据: - KB")
-        network_layout.addWidget(self.bbr_inflight_label)
-        
-        self.bbr_pacing_gain_label = QLabel("BBR发送增益: -")
-        network_layout.addWidget(self.bbr_pacing_gain_label)
-        
-        self.bbr_cwnd_gain_label = QLabel("BBR拥塞窗口增益: -")
-        network_layout.addWidget(self.bbr_cwnd_gain_label)
-        
         network_group.setLayout(network_layout)
         main_layout.addWidget(network_group)
         
@@ -520,6 +476,15 @@ class VideoPlayerGUI(QMainWindow):
         
         self.streaming_status_label = QLabel("流传输: 未开始")
         playback_layout.addWidget(self.streaming_status_label)
+        
+        # 新增缓冲区状态显示
+        self.buffer_progress_label = QLabel("缓冲区状态: 等待中...")
+        playback_layout.addWidget(self.buffer_progress_label)
+        
+        self.buffer_progress_bar = QProgressBar()
+        self.buffer_progress_bar.setRange(0, 100)
+        self.buffer_progress_bar.setValue(0)
+        playback_layout.addWidget(self.buffer_progress_bar)
         
         playback_group.setLayout(playback_layout)
         main_layout.addWidget(playback_group)
@@ -660,15 +625,6 @@ class VideoPlayerGUI(QMainWindow):
                 self.playback_status_label.setText("播放状态: 未开始")
                 self.streaming_status_label.setText("流传输: 未开始")
                 
-                # 重置BBR指标显示
-                self.bbr_state_label.setText("BBR状态: -")
-                self.bbr_bandwidth_label.setText("BBR带宽: - MB/s")
-                self.bbr_rtt_label.setText("BBR RTT: - ms")
-                self.bbr_cwnd_label.setText("BBR拥塞窗口: - KB")
-                self.bbr_inflight_label.setText("BBR在途数据: - KB")
-                self.bbr_pacing_gain_label.setText("BBR发送增益: -")
-                self.bbr_cwnd_gain_label.setText("BBR拥塞窗口增益: -")
-                
                 logger.info("视频播放已停止")
                 
             except Exception as e:
@@ -718,59 +674,6 @@ class VideoPlayerGUI(QMainWindow):
         if buffer_size > 0:
             buffer_percent = min(100, (buffer_size / (INITIAL_BUFFER_SIZE / 1024)) * 100)
             self.buffer_progress.setValue(int(buffer_percent))
-        
-        # 更新BBR算法状态 - 改进的BBR指标显示
-        if 'bbr_metrics' in info and info['bbr_metrics']:
-            bbr_metrics = info['bbr_metrics']
-            bbr_state = info.get('bbr_state', {})
-            
-            # 更新BBR状态
-            state_name = bbr_state.get('state', 'unknown')
-            self.bbr_state_label.setText(f"BBR状态: {state_name}")
-            
-            # 更新BBR带宽
-            bandwidth_mbps = bbr_metrics.bandwidth / 1024 / 1024
-            self.bbr_bandwidth_label.setText(f"BBR带宽: {bandwidth_mbps:.2f} MB/s")
-            
-            # 更新BBR RTT
-            rtt_ms = bbr_metrics.rtt * 1000
-            self.bbr_rtt_label.setText(f"BBR RTT: {rtt_ms:.2f} ms")
-            
-            # 更新BBR拥塞窗口
-            cwnd_kb = bbr_metrics.cwnd / 1024
-            self.bbr_cwnd_label.setText(f"BBR拥塞窗口: {cwnd_kb:.1f} KB")
-            
-            # 更新BBR在途数据
-            inflight_kb = bbr_metrics.inflight / 1024
-            self.bbr_inflight_label.setText(f"BBR在途数据: {inflight_kb:.1f} KB")
-            
-            # 更新BBR增益参数
-            pacing_gain = bbr_metrics.pacing_gain
-            self.bbr_pacing_gain_label.setText(f"BBR发送增益: {pacing_gain:.2f}")
-            
-            cwnd_gain = bbr_metrics.cwnd_gain
-            self.bbr_cwnd_gain_label.setText(f"BBR拥塞窗口增益: {cwnd_gain:.2f}")
-            
-            # 添加调试日志
-            logger.info(f"GUI BBR指标更新: 状态={state_name}, "
-                       f"带宽={bandwidth_mbps:.2f}MB/s, "
-                       f"RTT={rtt_ms:.2f}ms, "
-                       f"拥塞窗口={cwnd_kb:.1f}KB, "
-                       f"在途数据={inflight_kb:.1f}KB, "
-                       f"发送增益={pacing_gain:.2f}, "
-                       f"拥塞窗口增益={cwnd_gain:.2f}")
-        else:
-            # 如果没有BBR指标，显示默认值
-            self.bbr_state_label.setText("BBR状态: 不可用")
-            self.bbr_bandwidth_label.setText("BBR带宽: - MB/s")
-            self.bbr_rtt_label.setText("BBR RTT: - ms")
-            self.bbr_cwnd_label.setText("BBR拥塞窗口: - KB")
-            self.bbr_inflight_label.setText("BBR在途数据: - KB")
-            self.bbr_pacing_gain_label.setText("BBR发送增益: -")
-            self.bbr_cwnd_gain_label.setText("BBR拥塞窗口增益: -")
-            
-            # 添加调试日志
-            logger.warning("GUI BBR指标不可用")
     
     def update_playback_status(self, info):
         """更新播放状态"""
@@ -782,6 +685,17 @@ class VideoPlayerGUI(QMainWindow):
             self.playback_status_label.setText(f"播放状态: {playback}")
         else:
             self.playback_status_label.setText("播放状态: 未开始")
+        
+        # 更新缓冲区状态显示
+        if 'buffer_size' in info:
+            buffer_size = info['buffer_size']
+            if buffer_size > 0:
+                progress = min(100, (buffer_size / (INITIAL_BUFFER_SIZE)) * 100)
+                self.buffer_progress_bar.setValue(int(progress))
+                self.buffer_progress_label.setText(f"缓冲区状态: {buffer_size/1024:.1f} KB ({progress:.1f}%)")
+            else:
+                self.buffer_progress_bar.setValue(0)
+                self.buffer_progress_label.setText("缓冲区状态: 等待中...")
     
     def update_stats(self):
         """定期更新统计信息 - 改进的实现"""
@@ -791,27 +705,10 @@ class VideoPlayerGUI(QMainWindow):
             
             # 确保即使没有新的数据包到达，也能更新网络状态显示
             if hasattr(client, 'total_bytes_received') and hasattr(client, 'network_quality'):
-                # 获取BBR指标
-                bbr_metrics = client.get_bbr_metrics()
-                bbr_state = client.get_bbr_state_info()
-                
-                # 添加调试信息
-                if bbr_metrics:
-                    logger.debug(f"GUI获取到BBR指标: 带宽={bbr_metrics.bandwidth/1024/1024:.2f}MB/s, RTT={bbr_metrics.rtt*1000:.2f}ms")
-                else:
-                    logger.debug("GUI BBR指标获取失败")
-                
-                if bbr_state:
-                    logger.debug(f"GUI获取到BBR状态: {bbr_state.get('state', 'unknown')}")
-                else:
-                    logger.debug("GUI BBR状态获取失败")
-                
                 network_info = {
                     'bytes_received': client.total_bytes_received,
                     'quality': client.network_quality,
-                    'buffer_size': getattr(client, 'buffer_size', 0),
-                    'bbr_metrics': bbr_metrics,
-                    'bbr_state': bbr_state
+                    'buffer_size': getattr(client, 'buffer_size', 0)
                 }
                 self.update_network_status(network_info)
     
