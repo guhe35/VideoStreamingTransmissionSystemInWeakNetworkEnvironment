@@ -24,12 +24,12 @@ logger = logging.getLogger("quic-video-client")
 # 定义ALPN协议
 ALPN_PROTOCOLS = ["quic-demo"]
 
-# 网络质量等级定义
+# 网络质量等级定义 - H.265优化版本
 NETWORK_QUALITY = {
-    "HIGH": {"min_speed": 8000000},     # 8 Mbps
+    "HIGH": {"min_speed": 6000000},     # 6 Mbps (H.265更高效)
     "MEDIUM": {"min_speed": 3000000},   # 3 Mbps
-    "LOW": {"min_speed": 1000000},      # 1 Mbps
-    "VERY_LOW": {"min_speed": 0}        # 低于1 Mbps
+    "LOW": {"min_speed": 1500000},      # 1.5 Mbps
+    "VERY_LOW": {"min_speed": 0}        # 低于1.5 Mbps
 }
 
 # 初始缓冲区大小（字节）
@@ -241,20 +241,23 @@ class VideoClient(BBRQuicProtocol):
         try:
             info_parts = video_info_str.split(',')
             if len(info_parts) >= 9:
-                width, height, codec_name = info_parts[0:3]
+                width, height, original_codec = info_parts[0:3]
                 fps = info_parts[3]
                 audio_codec, audio_sample_rate, audio_channels = info_parts[4:7]
                 file_size = float(info_parts[7])
                 duration = float(info_parts[8])
 
-                logger.info(f"视频信息: {width}x{height}, 编解码器: {codec_name}, 帧率: {fps}fps")
+                # 显示实际使用的编码方式（H.265），而不是原始文件的编码方式
+                actual_codec = "H.265 (HEVC)"  # 服务器实际使用H.265编码
+                
+                logger.info(f"视频信息: {width}x{height}, 原始编解码器: {original_codec}, 传输编解码器: {actual_codec}, 帧率: {fps}fps")
                 logger.info(f"音频信息: 编解码器: {audio_codec}, 采样率: {audio_sample_rate}Hz, 声道数: {audio_channels}")
                 logger.info(f"文件大小: {file_size / 1024 / 1024:.2f} MB, 时长: {duration:.2f}秒")
 
                 # 保存解析的信息供播放使用
                 self.video_width = width
                 self.video_height = height
-                self.video_codec = codec_name
+                self.video_codec = actual_codec  # 使用实际传输的编码方式
                 self.video_fps = fps
                 self.audio_codec = audio_codec
                 self.audio_sample_rate = audio_sample_rate

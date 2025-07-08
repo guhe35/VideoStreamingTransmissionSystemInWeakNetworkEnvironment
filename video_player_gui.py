@@ -437,7 +437,7 @@ class VideoPlayerGUI(QMainWindow):
         main_layout.addWidget(video_group)
         
         # 视频信息区域
-        info_group = QGroupBox("视频信息")
+        info_group = QGroupBox("传输视频信息")
         info_layout = QVBoxLayout()
         
         self.video_info_label = QLabel("未加载视频")
@@ -647,13 +647,13 @@ class VideoPlayerGUI(QMainWindow):
     def update_video_info(self, info):
         """更新视频信息"""
         info_text = f"分辨率: {info['width']}x{info['height']}<br>"
-        info_text += f"视频编解码器: {info['codec']}<br>"
+        info_text += f"传输编码: {info['codec']}<br>"
         info_text += f"帧率: {info['fps']}fps<br>"
         info_text += f"音频编解码器: {info['audio_codec']}<br>"
         info_text += f"时长: {float(info['duration']):.2f}秒"
         
         self.video_info_label.setText(info_text)
-        self.log(f"已加载视频信息: {info['width']}x{info['height']}, {info['codec']}, {info['fps']}fps")
+        self.log(f"已加载视频信息: {info['width']}x{info['height']}, 传输编码: {info['codec']}, {info['fps']}fps")
     
     def update_network_status(self, info):
         """更新网络状态 - 改进的实现"""

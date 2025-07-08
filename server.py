@@ -29,16 +29,16 @@ ALPN_PROTOCOLS = ["quic-demo"]
 server_running = False
 server_task = None
 
-# 网络质量等级定义 - 优化版本
+# 网络质量等级定义 - H.265优化版本
 NETWORK_QUALITY = {
-    "ULTRA_HIGH": {"video_bitrate": "8M", "video_scale": "1280:720", "audio_bitrate": "192k", "min_speed": 12000000},
-    "HIGH": {"video_bitrate": "4M", "video_scale": "854:480", "audio_bitrate": "128k", "min_speed": 8000000},
-    "MEDIUM_HIGH": {"video_bitrate": "3M", "video_scale": "768:432", "audio_bitrate": "112k", "min_speed": 6000000},
-    "MEDIUM": {"video_bitrate": "2M", "video_scale": "640:360", "audio_bitrate": "96k", "min_speed": 4000000},
-    "MEDIUM_LOW": {"video_bitrate": "1.5M", "video_scale": "576:324", "audio_bitrate": "80k", "min_speed": 3000000},
-    "LOW": {"video_bitrate": "800k", "video_scale": "426:240", "audio_bitrate": "64k", "min_speed": 2000000},
-    "VERY_LOW": {"video_bitrate": "400k", "video_scale": "256:144", "audio_bitrate": "32k", "min_speed": 1000000},
-    "ULTRA_LOW": {"video_bitrate": "200k", "video_scale": "192:108", "audio_bitrate": "16k", "min_speed": 0}
+    "ULTRA_HIGH": {"video_bitrate": "6M", "video_scale": "1280:720", "audio_bitrate": "192k", "min_speed": 10000000},  # H.265更高效，降低比特率要求
+    "HIGH": {"video_bitrate": "3M", "video_scale": "854:480", "audio_bitrate": "128k", "min_speed": 6000000},
+    "MEDIUM_HIGH": {"video_bitrate": "2M", "video_scale": "768:432", "audio_bitrate": "112k", "min_speed": 4000000},
+    "MEDIUM": {"video_bitrate": "1.5M", "video_scale": "640:360", "audio_bitrate": "96k", "min_speed": 3000000},
+    "MEDIUM_LOW": {"video_bitrate": "1M", "video_scale": "576:324", "audio_bitrate": "80k", "min_speed": 2000000},
+    "LOW": {"video_bitrate": "600k", "video_scale": "426:240", "audio_bitrate": "64k", "min_speed": 1500000},
+    "VERY_LOW": {"video_bitrate": "300k", "video_scale": "256:144", "audio_bitrate": "32k", "min_speed": 800000},
+    "ULTRA_LOW": {"video_bitrate": "150k", "video_scale": "192:108", "audio_bitrate": "16k", "min_speed": 0}
 }
 
 # 网络测速结果缓存
@@ -267,14 +267,14 @@ class VideoServer(BBRQuicProtocol):
                 '-ss', '0',  # 固定从0开始
                 '-i', self.video_file_path,
                 '-f', 'mpegts',
-                '-vcodec', 'libx264', 
+                '-vcodec', 'libx265',  # 更换为H.265编码器
                 '-preset', 'ultrafast', 
                 '-tune', 'zerolatency',
                 '-b:v', quality_params['video_bitrate'], 
                 '-vf', f'scale={quality_params["video_scale"]}',
                 '-pix_fmt', 'yuv420p',  # 确保使用兼容的像素格式
                 '-g', '30',  # 设置GOP大小，每30帧一个关键帧
-                '-x264-params', 'keyint=30:min-keyint=30',  # 强制关键帧间隔
+                '-x265-params', 'keyint=30:min-keyint=30:bframes=0',  # H.265参数，禁用B帧以降低延迟
                 '-acodec', 'aac', 
                 '-b:a', quality_params['audio_bitrate'],
                 '-ar', '48000',  # 固定音频采样率
@@ -395,7 +395,7 @@ class VideoServer(BBRQuicProtocol):
     
     def _determine_quality_from_bbr(self, bbr_metrics: BBRMetrics) -> str:
         """
-        根据算法指标确定网络质量 - 优化实现
+        根据算法指标确定网络质量 - H.265优化实现
         
         Args:
             bbr_metrics: 算法指标
@@ -406,27 +406,27 @@ class VideoServer(BBRQuicProtocol):
         bandwidth = bbr_metrics.bandwidth
         rtt = bbr_metrics.rtt * 1000  # 转换为毫秒
         
-        # 综合考虑带宽和RTT
-        if bandwidth >= 12000000 and rtt <= 50:  # 12 Mbps, RTT <= 50ms
+        # 综合考虑带宽和RTT - H.265更高效，降低带宽要求
+        if bandwidth >= 10000000 and rtt <= 50:  # 10 Mbps, RTT <= 50ms
             return "ULTRA_HIGH"
-        elif bandwidth >= 8000000 and rtt <= 100:  # 8 Mbps, RTT <= 100ms
+        elif bandwidth >= 6000000 and rtt <= 100:  # 6 Mbps, RTT <= 100ms
             return "HIGH"
-        elif bandwidth >= 6000000 and rtt <= 150:  # 6 Mbps, RTT <= 150ms
+        elif bandwidth >= 4000000 and rtt <= 150:  # 4 Mbps, RTT <= 150ms
             return "MEDIUM_HIGH"
-        elif bandwidth >= 4000000 and rtt <= 200:  # 4 Mbps, RTT <= 200ms
+        elif bandwidth >= 3000000 and rtt <= 200:  # 3 Mbps, RTT <= 200ms
             return "MEDIUM"
-        elif bandwidth >= 3000000 and rtt <= 300:  # 3 Mbps, RTT <= 300ms
+        elif bandwidth >= 2000000 and rtt <= 300:  # 2 Mbps, RTT <= 300ms
             return "MEDIUM_LOW"
-        elif bandwidth >= 2000000 and rtt <= 500:  # 2 Mbps, RTT <= 500ms
+        elif bandwidth >= 1500000 and rtt <= 500:  # 1.5 Mbps, RTT <= 500ms
             return "LOW"
-        elif bandwidth >= 1000000 and rtt <= 1000:  # 1 Mbps, RTT <= 1000ms
+        elif bandwidth >= 800000 and rtt <= 1000:  # 0.8 Mbps, RTT <= 1000ms
             return "VERY_LOW"
         else:
             return "ULTRA_LOW"
     
     def _determine_quality_from_speed(self, speed: float) -> str:
         """
-        根据传统网络测速确定网络质量 - 优化实现
+        根据传统网络测速确定网络质量 - H.265优化实现
         
         Args:
             speed: 网络速度 (bytes/second)
@@ -434,20 +434,20 @@ class VideoServer(BBRQuicProtocol):
         Returns:
             网络质量等级
         """
-        # 使用更精确的带宽阈值
-        if speed >= 12000000:  # 12 Mbps
+        # 使用更精确的带宽阈值 - H.265更高效，降低带宽要求
+        if speed >= 10000000:  # 10 Mbps
             return "ULTRA_HIGH"
-        elif speed >= 8000000:  # 8 Mbps
-            return "HIGH"
         elif speed >= 6000000:  # 6 Mbps
-            return "MEDIUM_HIGH"
+            return "HIGH"
         elif speed >= 4000000:  # 4 Mbps
-            return "MEDIUM"
+            return "MEDIUM_HIGH"
         elif speed >= 3000000:  # 3 Mbps
-            return "MEDIUM_LOW"
+            return "MEDIUM"
         elif speed >= 2000000:  # 2 Mbps
+            return "MEDIUM_LOW"
+        elif speed >= 1500000:  # 1.5 Mbps
             return "LOW"
-        elif speed >= 1000000:  # 1 Mbps
+        elif speed >= 800000:  # 0.8 Mbps
             return "VERY_LOW"
         else:
             return "ULTRA_LOW"
@@ -536,14 +536,14 @@ class VideoServer(BBRQuicProtocol):
                 '-ss', '0',  # 固定从0开始
                 '-i', input_file,
                 '-f', 'mpegts',
-                '-vcodec', 'libx264', 
+                '-vcodec', 'libx265',  # 更换为H.265编码器
                 '-preset', 'ultrafast', 
                 '-tune', 'zerolatency',
                 '-b:v', video_bitrate, 
                 '-vf', f'scale={video_scale}',
                 '-pix_fmt', 'yuv420p',  # 确保使用兼容的像素格式
                 '-g', '30',  # 设置GOP大小，每30帧一个关键帧
-                '-x264-params', 'keyint=30:min-keyint=30',  # 强制关键帧间隔
+                '-x265-params', 'keyint=30:min-keyint=30:bframes=0',  # H.265参数，禁用B帧以降低延迟
                 '-acodec', 'aac', 
                 '-b:a', audio_bitrate,
                 '-ar', '48000',  # 固定音频采样率
@@ -834,7 +834,8 @@ async def analyze_video(input_file):
         # 构建视频信息字符串
         video_info = f"{width},{height},{codec_name},{fps},{audio_codec},{audio_sample_rate},{audio_channels},{file_size},{duration}"
 
-        logger.info(f"原始视频: {width}x{height}, 编解码器: {codec_name}, 帧率: {fps}fps, 时长: {duration:.2f}秒")
+        logger.info(f"原始视频: {width}x{height}, 原始编解码器: {codec_name}, 帧率: {fps}fps, 时长: {duration:.2f}秒")
+        logger.info(f"传输编码: H.265 (HEVC) - 使用libx265编码器")
         if audio_stream:
             logger.info(f"原始音频: 编解码器: {audio_codec}, 采样率: {audio_sample_rate}Hz, 声道数: {audio_channels}")
 
