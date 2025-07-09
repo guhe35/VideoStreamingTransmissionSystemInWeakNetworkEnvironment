@@ -29,16 +29,58 @@ ALPN_PROTOCOLS = ["quic-demo"]
 server_running = False
 server_task = None
 
-# 网络质量等级定义 - H.265优化版本
+# 网络质量等级定义 - 统一的5级弱网环境评估系统（H.265优化）
 NETWORK_QUALITY = {
-    "ULTRA_HIGH": {"video_bitrate": "6M", "video_scale": "1280:720", "audio_bitrate": "192k", "min_speed": 10000000},  # H.265更高效，降低比特率要求
-    "HIGH": {"video_bitrate": "3M", "video_scale": "854:480", "audio_bitrate": "128k", "min_speed": 6000000},
-    "MEDIUM_HIGH": {"video_bitrate": "2M", "video_scale": "768:432", "audio_bitrate": "112k", "min_speed": 4000000},
-    "MEDIUM": {"video_bitrate": "1.5M", "video_scale": "640:360", "audio_bitrate": "96k", "min_speed": 3000000},
-    "MEDIUM_LOW": {"video_bitrate": "1M", "video_scale": "576:324", "audio_bitrate": "80k", "min_speed": 2000000},
-    "LOW": {"video_bitrate": "600k", "video_scale": "426:240", "audio_bitrate": "64k", "min_speed": 1500000},
-    "VERY_LOW": {"video_bitrate": "300k", "video_scale": "256:144", "audio_bitrate": "32k", "min_speed": 800000},
-    "ULTRA_LOW": {"video_bitrate": "150k", "video_scale": "192:108", "audio_bitrate": "16k", "min_speed": 0}
+    "WEAK_GOOD": {
+        "video_bitrate": "800k", 
+        "video_scale": "640:360", 
+        "audio_bitrate": "64k", 
+        "min_speed": 1000000,      # 1 Mbps
+        "min_rtt": 0,
+        "max_rtt": 100,            # RTT <= 100ms
+        "max_loss_rate": 0.01,     # 丢包率 <= 1%
+        "description": "弱网良好"
+    },
+    "WEAK_MEDIUM": {
+        "video_bitrate": "400k", 
+        "video_scale": "480:270", 
+        "audio_bitrate": "48k", 
+        "min_speed": 500000,       # 500 Kbps
+        "min_rtt": 100,
+        "max_rtt": 200,            # 100ms < RTT <= 200ms
+        "max_loss_rate": 0.02,     # 丢包率 <= 2%
+        "description": "弱网中等"
+    },
+    "WEAK_POOR": {
+        "video_bitrate": "200k", 
+        "video_scale": "320:180", 
+        "audio_bitrate": "32k", 
+        "min_speed": 250000,       # 250 Kbps
+        "min_rtt": 200,
+        "max_rtt": 400,            # 200ms < RTT <= 400ms
+        "max_loss_rate": 0.05,     # 丢包率 <= 5%
+        "description": "弱网较差"
+    },
+    "WEAK_VERY_POOR": {
+        "video_bitrate": "100k", 
+        "video_scale": "240:135", 
+        "audio_bitrate": "24k", 
+        "min_speed": 100000,       # 100 Kbps
+        "min_rtt": 400,
+        "max_rtt": 800,            # 400ms < RTT <= 800ms
+        "max_loss_rate": 0.1,      # 丢包率 <= 10%
+        "description": "弱网极差"
+    },
+    "WEAK_CRITICAL": {
+        "video_bitrate": "50k", 
+        "video_scale": "160:90", 
+        "audio_bitrate": "16k", 
+        "min_speed": 0,            # < 100 Kbps
+        "min_rtt": 800,
+        "max_rtt": float('inf'),   # RTT > 800ms
+        "max_loss_rate": 1.0,      # 丢包率 > 10%
+        "description": "弱网临界"
+    }
 }
 
 # 网络测速结果缓存
@@ -55,7 +97,7 @@ class VideoServer(BBRQuicProtocol):
         self.ffmpeg_process = None
         self.stream_port = 8889  # 视频流端口
         self.video_file_path = None  # 视频文件路径
-        self.network_quality = "MEDIUM"  # 默认网络质量
+        self.network_quality = "WEAK_MEDIUM"  # 默认网络质量
         self.network_monitor_thread = None
         self.stop_monitor = False
         self.buffer = bytearray()  # 初始化缓冲区
@@ -76,6 +118,17 @@ class VideoServer(BBRQuicProtocol):
         self.quality_trend_history = []
         self.max_trend_history = 20
         self.prediction_threshold = 0.7  # 预测置信度阈值
+        
+        # 稳定性机制 - 新增
+        self.quality_stability_enabled = True
+        self.quality_stability_threshold = 3  # 需要连续3次相同结果才切换
+        self.quality_candidate = None  # 候选质量等级
+        self.quality_candidate_count = 0  # 候选质量等级连续出现次数
+        self.quality_change_cooldown = 8.0  # 质量切换冷却时间（秒）
+        self.last_quality_change_time = time.time()
+        self.quality_hysteresis = True  # 启用迟滞机制
+        self.quality_change_history = []  # 质量变化历史
+        self.max_quality_history = 10
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
@@ -149,46 +202,15 @@ class VideoServer(BBRQuicProtocol):
                     except Exception as e:
                         logger.error(f"关闭FFmpeg进程时出错: {e}")
             
-            elif message.startswith("NETWORK_FEEDBACK:"):
-                # 接收客户端的网络反馈 - 优化处理
+            elif message.startswith("NETWORK_FEEDBACK:") or message.startswith("ENHANCED_FEEDBACK:"):
+                # 接收客户端的网络反馈 - 支持增强反馈
                 try:
-                    feedback_parts = message.split(":")
-                    if len(feedback_parts) >= 2:
-                        quality_level = feedback_parts[1].strip()
-                        
-                        # 解析详细的反馈信息
-                        if len(feedback_parts) >= 5:
-                            try:
-                                bandwidth = float(feedback_parts[2])
-                                rtt = float(feedback_parts[3])
-                                buffer_size = int(feedback_parts[4])
-                                
-                                logger.info(f"收到详细网络反馈: 质量={quality_level}, "
-                                          f"带宽={bandwidth/1000000:.2f}Mbps, "
-                                          f"RTT={rtt:.2f}ms, "
-                                          f"缓冲区={buffer_size/1024:.1f}KB")
-                                
-                                # 根据缓冲区状态调整策略
-                                if buffer_size < 256 * 1024:  # 缓冲区不足
-                                    logger.warning("客户端缓冲区不足，考虑降低质量")
-                                    # 可以主动降低质量等级
-                                    if quality_level in NETWORK_QUALITY:
-                                        quality_levels = list(NETWORK_QUALITY.keys())
-                                        current_level = quality_levels.index(quality_level)
-                                        if current_level < len(quality_levels) - 1:
-                                            quality_level = quality_levels[current_level + 1]
-                                            logger.info(f"主动降低质量到: {quality_level}")
-                                
-                            except (ValueError, IndexError):
-                                logger.warning("无法解析详细反馈信息，使用基本质量等级")
-                        
-                        if quality_level in NETWORK_QUALITY:
-                            self.network_quality = quality_level
-                            logger.info(f"根据客户端反馈调整网络质量为: {quality_level}")
-                            
-                            # 如果启用了自适应编码，立即调整编码参数
-                            if self.adaptive_encoding_enabled and self.is_streaming:
-                                self._adjust_encoding_parameters(quality_level)
+                    if message.startswith("ENHANCED_FEEDBACK:"):
+                        # 处理增强反馈
+                        self._process_enhanced_feedback(message)
+                    else:
+                        # 处理传统反馈（向后兼容）
+                        self._process_traditional_feedback(message)
                 except Exception as e:
                     logger.error(f"处理网络反馈时出错: {e}")
             
@@ -227,7 +249,7 @@ class VideoServer(BBRQuicProtocol):
         try:
             if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
                 # 获取新的编码参数
-                quality_params = NETWORK_QUALITY.get(quality_level, NETWORK_QUALITY["MEDIUM"])
+                quality_params = NETWORK_QUALITY.get(quality_level, NETWORK_QUALITY["WEAK_MEDIUM"])
                 
                 logger.info(f"调整编码参数: {quality_level} - "
                           f"视频码率: {quality_params['video_bitrate']}, "
@@ -333,7 +355,7 @@ class VideoServer(BBRQuicProtocol):
                         self.bbr_metrics_history.pop(0)
                     
                     # 根据带宽确定质量级别
-                    new_quality = self._determine_quality_from_bbr(bbr_metrics)
+                    raw_quality = self._determine_quality_from_bbr(bbr_metrics)
                     
                     current_time = time.time()
                     
@@ -341,25 +363,31 @@ class VideoServer(BBRQuicProtocol):
                     if (self.quality_prediction_enabled and 
                         current_time - last_prediction_check > prediction_check_interval):
                         predicted_quality = self._predict_quality_trend()
-                        if predicted_quality and predicted_quality != new_quality:
+                        if predicted_quality and predicted_quality != raw_quality:
                             # 如果预测的质量与当前检测的质量不同，考虑提前调整
-                            logger.info(f"预测性调整: 当前检测 {new_quality}, 预测 {predicted_quality}")
+                            logger.info(f"预测性调整: 当前检测 {raw_quality}, 预测 {predicted_quality}")
                             # 可以选择使用预测的质量或当前检测的质量
                             # 这里使用预测的质量，但增加额外的稳定性检查
                             if abs(current_speed - self.quality_trend_history[-1]['bandwidth']) < current_speed * 0.1:
-                                new_quality = predicted_quality
+                                raw_quality = predicted_quality
                         last_prediction_check = current_time
                     
-                    # 只有当质量变化且上次调整已经超过稳定期时才进行调整
-                    if new_quality != self.network_quality and current_time - last_quality_change_time > quality_stability_period:
+                    # 应用稳定性机制
+                    new_quality = self._apply_quality_stability(raw_quality, current_time)
+                    
+                    # 只有当质量实际发生变化时才进行调整
+                    if new_quality != self.network_quality:
                         logger.info(f"网络质量变化: {self.network_quality} -> {new_quality} "
                                   f"(带宽: {current_speed/1000000:.2f} Mbps, RTT: {current_rtt:.2f}ms)")
                         
                         # 更新质量趋势历史
                         self._update_quality_trend_history(new_quality)
                         
+                        # 记录质量变化历史
+                        self._record_quality_change(self.network_quality, new_quality, current_time)
+                        
                         self.network_quality = new_quality
-                        last_quality_change_time = current_time
+                        self.last_quality_change_time = current_time
                         
                         # 如果启用了自适应编码，调整编码参数
                         if self.adaptive_encoding_enabled:
@@ -395,38 +423,74 @@ class VideoServer(BBRQuicProtocol):
     
     def _determine_quality_from_bbr(self, bbr_metrics: BBRMetrics) -> str:
         """
-        根据算法指标确定网络质量 - H.265优化实现
+        根据BBR算法指标确定网络质量 - 综合评估实现
         
         Args:
-            bbr_metrics: 算法指标
+            bbr_metrics: BBR算法指标
             
         Returns:
             网络质量等级
         """
-        bandwidth = bbr_metrics.bandwidth
+        bandwidth = bbr_metrics.bandwidth  # bytes/second
         rtt = bbr_metrics.rtt * 1000  # 转换为毫秒
         
-        # 综合考虑带宽和RTT - H.265更高效，降低带宽要求
-        if bandwidth >= 10000000 and rtt <= 50:  # 10 Mbps, RTT <= 50ms
-            return "ULTRA_HIGH"
-        elif bandwidth >= 6000000 and rtt <= 100:  # 6 Mbps, RTT <= 100ms
-            return "HIGH"
-        elif bandwidth >= 4000000 and rtt <= 150:  # 4 Mbps, RTT <= 150ms
-            return "MEDIUM_HIGH"
-        elif bandwidth >= 3000000 and rtt <= 200:  # 3 Mbps, RTT <= 200ms
-            return "MEDIUM"
-        elif bandwidth >= 2000000 and rtt <= 300:  # 2 Mbps, RTT <= 300ms
-            return "MEDIUM_LOW"
-        elif bandwidth >= 1500000 and rtt <= 500:  # 1.5 Mbps, RTT <= 500ms
-            return "LOW"
-        elif bandwidth >= 800000 and rtt <= 1000:  # 0.8 Mbps, RTT <= 1000ms
-            return "VERY_LOW"
-        else:
-            return "ULTRA_LOW"
+        # 获取丢包率和其他拥塞信号
+        loss_rate = getattr(bbr_metrics, 'loss_rate', 0.0)
+        
+        # 综合评估：带宽 + RTT + 丢包率
+        quality_score = 0
+        
+        # 带宽评分 (40%)
+        if bandwidth >= 1000000:      # >= 1 Mbps
+            quality_score += 40
+        elif bandwidth >= 500000:     # >= 500 Kbps
+            quality_score += 30
+        elif bandwidth >= 250000:     # >= 250 Kbps
+            quality_score += 20
+        elif bandwidth >= 100000:     # >= 100 Kbps
+            quality_score += 10
+        else:                         # < 100 Kbps
+            quality_score += 0
+        
+        # RTT评分 (35%)
+        if rtt <= 100:                # RTT <= 100ms
+            quality_score += 35
+        elif rtt <= 200:              # RTT <= 200ms
+            quality_score += 28
+        elif rtt <= 400:              # RTT <= 400ms
+            quality_score += 21
+        elif rtt <= 800:              # RTT <= 800ms
+            quality_score += 14
+        else:                         # RTT > 800ms
+            quality_score += 0
+        
+        # 丢包率评分 (25%)
+        if loss_rate <= 0.01:         # 丢包率 <= 1%
+            quality_score += 25
+        elif loss_rate <= 0.02:       # 丢包率 <= 2%
+            quality_score += 20
+        elif loss_rate <= 0.05:       # 丢包率 <= 5%
+            quality_score += 15
+        elif loss_rate <= 0.1:        # 丢包率 <= 10%
+            quality_score += 10
+        else:                         # 丢包率 > 10%
+            quality_score += 0
+        
+        # 根据综合评分确定质量等级
+        if quality_score >= 85:       # 85-100分
+            return "WEAK_GOOD"
+        elif quality_score >= 65:     # 65-84分
+            return "WEAK_MEDIUM"
+        elif quality_score >= 45:     # 45-64分
+            return "WEAK_POOR"
+        elif quality_score >= 25:     # 25-44分
+            return "WEAK_VERY_POOR"
+        else:                         # 0-24分
+            return "WEAK_CRITICAL"
     
     def _determine_quality_from_speed(self, speed: float) -> str:
         """
-        根据传统网络测速确定网络质量 - H.265优化实现
+        根据传统网络测速确定网络质量 - 统一评估实现
         
         Args:
             speed: 网络速度 (bytes/second)
@@ -434,23 +498,17 @@ class VideoServer(BBRQuicProtocol):
         Returns:
             网络质量等级
         """
-        # 使用更精确的带宽阈值 - H.265更高效，降低带宽要求
-        if speed >= 10000000:  # 10 Mbps
-            return "ULTRA_HIGH"
-        elif speed >= 6000000:  # 6 Mbps
-            return "HIGH"
-        elif speed >= 4000000:  # 4 Mbps
-            return "MEDIUM_HIGH"
-        elif speed >= 3000000:  # 3 Mbps
-            return "MEDIUM"
-        elif speed >= 2000000:  # 2 Mbps
-            return "MEDIUM_LOW"
-        elif speed >= 1500000:  # 1.5 Mbps
-            return "LOW"
-        elif speed >= 800000:  # 0.8 Mbps
-            return "VERY_LOW"
-        else:
-            return "ULTRA_LOW"
+        # 仅基于带宽的简化评估（传统测速缺乏RTT和丢包率信息）
+        if speed >= 1000000:    # >= 1 Mbps
+            return "WEAK_GOOD"
+        elif speed >= 500000:   # >= 500 Kbps
+            return "WEAK_MEDIUM"
+        elif speed >= 250000:   # >= 250 Kbps
+            return "WEAK_POOR"
+        elif speed >= 100000:   # >= 100 Kbps
+            return "WEAK_VERY_POOR"
+        else:                   # < 100 Kbps
+            return "WEAK_CRITICAL"
     
     def measure_network_speed(self):
         """测量当前网络速度 - 改进的实现"""
@@ -714,65 +772,244 @@ class VideoServer(BBRQuicProtocol):
 
     def _predict_quality_trend(self) -> Optional[str]:
         """
-        预测网络质量变化趋势 - 新增
+        预测网络质量变化趋势 - 增强的预测算法
         
         Returns:
             预测的质量等级，如果无法预测则返回None
         """
-        if len(self.quality_trend_history) < 5:
+        if len(self.quality_trend_history) < 8:  # 需要更多历史数据
             return None
         
         try:
-            # 分析最近的质量变化趋势
-            recent_trends = self.quality_trend_history[-10:]
+            # 使用多种预测方法的组合
+            trend_prediction = self._predict_by_trend_analysis()
+            pattern_prediction = self._predict_by_pattern_recognition()
+            bandwidth_prediction = self._predict_by_bandwidth_trend()
+            rtt_prediction = self._predict_by_rtt_trend()
             
-            # 计算质量变化方向
-            improvements = 0
-            degradations = 0
+            # 预测结果投票机制
+            predictions = [p for p in [trend_prediction, pattern_prediction, bandwidth_prediction, rtt_prediction] if p is not None]
             
-            for i in range(1, len(recent_trends)):
-                prev_quality = recent_trends[i-1]['quality']
-                curr_quality = recent_trends[i]['quality']
-                
-                # 获取质量等级的数字表示
-                quality_levels = list(NETWORK_QUALITY.keys())
-                prev_level = quality_levels.index(prev_quality) if prev_quality in quality_levels else 3
-                curr_level = quality_levels.index(curr_quality) if curr_quality in quality_levels else 3
-                
-                if curr_level < prev_level:  # 质量提升
-                    improvements += 1
-                elif curr_level > prev_level:  # 质量下降
-                    degradations += 1
-            
-            # 计算预测置信度
-            total_changes = improvements + degradations
-            if total_changes == 0:
+            if not predictions:
                 return None
             
-            if improvements / total_changes > self.prediction_threshold:
-                # 预测质量将提升
-                current_quality = self.network_quality
-                quality_levels = list(NETWORK_QUALITY.keys())
-                current_level = quality_levels.index(current_quality) if current_quality in quality_levels else 3
-                if current_level > 0:
-                    predicted_quality = quality_levels[current_level - 1]
-                    logger.info(f"预测网络质量将提升到: {predicted_quality}")
-                    return predicted_quality
-            elif degradations / total_changes > self.prediction_threshold:
-                # 预测质量将下降
-                current_quality = self.network_quality
-                quality_levels = list(NETWORK_QUALITY.keys())
-                current_level = quality_levels.index(current_quality) if current_quality in quality_levels else 3
-                if current_level < len(quality_levels) - 1:
-                    predicted_quality = quality_levels[current_level + 1]
-                    logger.info(f"预测网络质量将下降到: {predicted_quality}")
-                    return predicted_quality
+            # 统计每个预测结果的投票数
+            prediction_votes = {}
+            for prediction in predictions:
+                prediction_votes[prediction] = prediction_votes.get(prediction, 0) + 1
+            
+            # 选择投票数最多的预测结果
+            max_votes = max(prediction_votes.values())
+            if max_votes >= 2:  # 至少有2种方法同意
+                for prediction, votes in prediction_votes.items():
+                    if votes == max_votes:
+                        logger.info(f"预测结果 (投票: {votes}/{len(predictions)}): {prediction}")
+                        return prediction
             
             return None
             
         except Exception as e:
             logger.error(f"预测质量趋势时出错: {e}")
             return None
+    
+    def _predict_by_trend_analysis(self) -> Optional[str]:
+        """
+        基于趋势分析的预测 - 新增
+        
+        Returns:
+            预测的质量等级
+        """
+        recent_trends = self.quality_trend_history[-10:]
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        
+        # 计算质量变化趋势
+        improvements = 0
+        degradations = 0
+        
+        for i in range(1, len(recent_trends)):
+            prev_quality = recent_trends[i-1]['quality']
+            curr_quality = recent_trends[i]['quality']
+            
+            prev_level = quality_levels.index(prev_quality) if prev_quality in quality_levels else 2
+            curr_level = quality_levels.index(curr_quality) if curr_quality in quality_levels else 2
+            
+            if curr_level < prev_level:
+                improvements += 1
+            elif curr_level > prev_level:
+                degradations += 1
+        
+        total_changes = improvements + degradations
+        if total_changes == 0:
+            return None
+        
+        if improvements / total_changes > 0.7:
+            # 预测质量提升
+            current_level = quality_levels.index(self.network_quality)
+            if current_level > 0:
+                return quality_levels[current_level - 1]
+        elif degradations / total_changes > 0.7:
+            # 预测质量下降
+            current_level = quality_levels.index(self.network_quality)
+            if current_level < len(quality_levels) - 1:
+                return quality_levels[current_level + 1]
+        
+        return None
+    
+    def _predict_by_pattern_recognition(self) -> Optional[str]:
+        """
+        基于模式识别的预测 - 新增
+        
+        Returns:
+            预测的质量等级
+        """
+        if len(self.quality_trend_history) < 12:
+            return None
+        
+        # 检查周期性模式
+        recent_history = self.quality_trend_history[-12:]
+        
+        # 检查是否有规律的质量变化模式
+        quality_sequence = [item['quality'] for item in recent_history]
+        
+        # 检查短周期模式（3-4个数据点的重复）
+        for period in [3, 4, 6]:
+            if len(quality_sequence) >= period * 2:
+                pattern = quality_sequence[-period:]
+                previous_pattern = quality_sequence[-period*2:-period]
+                
+                # 如果模式重复，预测下一个值
+                if pattern == previous_pattern:
+                    next_index = len(quality_sequence) % period
+                    if next_index < len(pattern):
+                        predicted_quality = pattern[next_index]
+                        logger.debug(f"检测到周期性模式 (周期: {period}): {predicted_quality}")
+                        return predicted_quality
+        
+        return None
+    
+    def _predict_by_bandwidth_trend(self) -> Optional[str]:
+        """
+        基于带宽趋势的预测 - 新增
+        
+        Returns:
+            预测的质量等级
+        """
+        if len(self.quality_trend_history) < 6:
+            return None
+        
+        recent_trends = self.quality_trend_history[-6:]
+        bandwidths = [item['bandwidth'] for item in recent_trends]
+        
+        # 计算带宽变化率
+        bandwidth_changes = []
+        for i in range(1, len(bandwidths)):
+            if bandwidths[i-1] > 0:
+                change_rate = (bandwidths[i] - bandwidths[i-1]) / bandwidths[i-1]
+                bandwidth_changes.append(change_rate)
+        
+        if not bandwidth_changes:
+            return None
+        
+        # 计算平均变化率
+        avg_change_rate = sum(bandwidth_changes) / len(bandwidth_changes)
+        
+        # 预测下一时刻的带宽
+        current_bandwidth = bandwidths[-1]
+        predicted_bandwidth = current_bandwidth * (1 + avg_change_rate)
+        
+        # 根据预测带宽确定质量等级
+        return self._bandwidth_to_quality(predicted_bandwidth)
+    
+    def _predict_by_rtt_trend(self) -> Optional[str]:
+        """
+        基于RTT趋势的预测 - 新增
+        
+        Returns:
+            预测的质量等级
+        """
+        if len(self.quality_trend_history) < 6:
+            return None
+        
+        recent_trends = self.quality_trend_history[-6:]
+        rtts = [item['rtt'] for item in recent_trends]
+        
+        # 计算RTT变化率
+        rtt_changes = []
+        for i in range(1, len(rtts)):
+            if rtts[i-1] > 0:
+                change_rate = (rtts[i] - rtts[i-1]) / rtts[i-1]
+                rtt_changes.append(change_rate)
+        
+        if not rtt_changes:
+            return None
+        
+        # 计算平均变化率
+        avg_change_rate = sum(rtt_changes) / len(rtt_changes)
+        
+        # 预测下一时刻的RTT
+        current_rtt = rtts[-1]
+        predicted_rtt = current_rtt * (1 + avg_change_rate)
+        
+        # 根据预测RTT调整质量预测
+        if predicted_rtt > current_rtt * 1.2:  # RTT显著增加
+            return self._degrade_quality(self.network_quality)
+        elif predicted_rtt < current_rtt * 0.8:  # RTT显著减少
+            return self._improve_quality(self.network_quality)
+        
+        return None
+    
+    def _bandwidth_to_quality(self, bandwidth: float) -> str:
+        """
+        根据带宽确定质量等级 - 新增
+        
+        Args:
+            bandwidth: 带宽 (bytes/second)
+            
+        Returns:
+            质量等级
+        """
+        if bandwidth >= 1000000:
+            return "WEAK_GOOD"
+        elif bandwidth >= 500000:
+            return "WEAK_MEDIUM"
+        elif bandwidth >= 250000:
+            return "WEAK_POOR"
+        elif bandwidth >= 100000:
+            return "WEAK_VERY_POOR"
+        else:
+            return "WEAK_CRITICAL"
+    
+    def _improve_quality(self, current_quality: str) -> Optional[str]:
+        """
+        提升质量等级 - 新增
+        
+        Args:
+            current_quality: 当前质量等级
+            
+        Returns:
+            提升后的质量等级
+        """
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        current_index = quality_levels.index(current_quality)
+        if current_index > 0:
+            return quality_levels[current_index - 1]
+        return None
+    
+    def _degrade_quality(self, current_quality: str) -> Optional[str]:
+        """
+        降低质量等级 - 新增
+        
+        Args:
+            current_quality: 当前质量等级
+            
+        Returns:
+            降低后的质量等级
+        """
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        current_index = quality_levels.index(current_quality)
+        if current_index < len(quality_levels) - 1:
+            return quality_levels[current_index + 1]
+        return None
     
     def _update_quality_trend_history(self, new_quality: str):
         """
@@ -797,6 +1034,358 @@ class VideoServer(BBRQuicProtocol):
                 
         except Exception as e:
             logger.error(f"更新质量趋势历史时出错: {e}")
+    
+    def _apply_quality_stability(self, raw_quality: str, current_time: float) -> str:
+        """
+        应用质量稳定性机制 - 新增
+        
+        Args:
+            raw_quality: 原始质量检测结果
+            current_time: 当前时间
+            
+        Returns:
+            经过稳定性机制处理的质量等级
+        """
+        if not self.quality_stability_enabled:
+            return raw_quality
+        
+        # 检查冷却时间
+        if current_time - self.last_quality_change_time < self.quality_change_cooldown:
+            logger.debug(f"质量切换冷却中，剩余时间: {self.quality_change_cooldown - (current_time - self.last_quality_change_time):.1f}秒")
+            return self.network_quality  # 保持当前质量
+        
+        # 如果原始质量与当前质量相同，重置候选计数
+        if raw_quality == self.network_quality:
+            self.quality_candidate = None
+            self.quality_candidate_count = 0
+            return self.network_quality
+        
+        # 应用迟滞机制
+        if self.quality_hysteresis:
+            adjusted_quality = self._apply_hysteresis(raw_quality)
+        else:
+            adjusted_quality = raw_quality
+        
+        # 如果调整后的质量与当前质量相同，不需要切换
+        if adjusted_quality == self.network_quality:
+            return self.network_quality
+        
+        # 更新候选质量
+        if adjusted_quality == self.quality_candidate:
+            self.quality_candidate_count += 1
+        else:
+            self.quality_candidate = adjusted_quality
+            self.quality_candidate_count = 1
+        
+        # 检查是否达到稳定性阈值
+        if self.quality_candidate_count >= self.quality_stability_threshold:
+            logger.info(f"质量稳定性阈值达到: {self.quality_candidate} (连续{self.quality_candidate_count}次)")
+            self.quality_candidate = None
+            self.quality_candidate_count = 0
+            return adjusted_quality
+        else:
+            logger.debug(f"质量候选: {self.quality_candidate} (连续{self.quality_candidate_count}/{self.quality_stability_threshold}次)")
+            return self.network_quality  # 保持当前质量直到达到阈值
+    
+    def _apply_hysteresis(self, raw_quality: str) -> str:
+        """
+        应用迟滞机制避免在边界附近频繁切换 - 新增
+        
+        Args:
+            raw_quality: 原始质量等级
+            
+        Returns:
+            经过迟滞处理的质量等级
+        """
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        current_index = quality_levels.index(self.network_quality)
+        raw_index = quality_levels.index(raw_quality)
+        
+        # 如果质量变化幅度很小（相邻等级），需要更强的信号才切换
+        if abs(raw_index - current_index) == 1:
+            # 检查最近的质量变化历史
+            if len(self.quality_change_history) > 0:
+                recent_changes = [change for change in self.quality_change_history 
+                                if time.time() - change['timestamp'] < 30.0]  # 最近30秒
+                
+                # 如果最近变化过于频繁，增加稳定性要求
+                if len(recent_changes) >= 3:
+                    logger.debug("检测到频繁质量变化，增加稳定性要求")
+                    return self.network_quality  # 保持当前质量
+        
+        return raw_quality
+    
+    def _record_quality_change(self, old_quality: str, new_quality: str, timestamp: float):
+        """
+        记录质量变化历史 - 新增
+        
+        Args:
+            old_quality: 旧质量等级
+            new_quality: 新质量等级
+            timestamp: 变化时间戳
+        """
+        change_record = {
+            'old_quality': old_quality,
+            'new_quality': new_quality,
+            'timestamp': timestamp,
+            'direction': self._get_quality_change_direction(old_quality, new_quality)
+        }
+        
+        self.quality_change_history.append(change_record)
+        
+        # 限制历史记录大小
+        if len(self.quality_change_history) > self.max_quality_history:
+            self.quality_change_history.pop(0)
+        
+        logger.info(f"记录质量变化: {old_quality} -> {new_quality} ({change_record['direction']})")
+    
+    def _get_quality_change_direction(self, old_quality: str, new_quality: str) -> str:
+        """
+        获取质量变化方向 - 新增
+        
+        Args:
+            old_quality: 旧质量等级
+            new_quality: 新质量等级
+            
+        Returns:
+            变化方向字符串
+        """
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        old_index = quality_levels.index(old_quality)
+        new_index = quality_levels.index(new_quality)
+        
+        if new_index < old_index:
+            return "升级"
+        elif new_index > old_index:
+            return "降级"
+        else:
+            return "不变"
+    
+    def _process_enhanced_feedback(self, message: str):
+        """
+        处理增强反馈消息 - 新增
+        
+        Args:
+            message: 增强反馈消息
+        """
+        try:
+            parts = message.split(":")
+            if len(parts) < 9:
+                logger.warning("增强反馈消息格式不完整")
+                return
+            
+            # 解析基本信息
+            quality_level = parts[1]
+            bandwidth = float(parts[2])
+            rtt = float(parts[3])
+            buffer_size = int(parts[4])
+            feedback_weight = float(parts[5])
+            validation_score = float(parts[6])
+            quality_stability = float(parts[7])
+            measurement_confidence = float(parts[8])
+            
+            # 解析BBR指标（如果可用）
+            bbr_metrics = {}
+            if len(parts) >= 13:
+                bbr_metrics = {
+                    'bandwidth': float(parts[9]),
+                    'rtt': float(parts[10]),
+                    'loss_rate': float(parts[11]),
+                    'confidence': float(parts[12])
+                }
+            
+            logger.info(f"收到增强网络反馈: 质量={quality_level}, "
+                       f"带宽={bandwidth/1000000:.2f}Mbps, "
+                       f"RTT={rtt:.2f}ms, "
+                       f"权重={feedback_weight:.2f}, "
+                       f"验证分数={validation_score:.2f}")
+            
+            # 验证反馈质量
+            if validation_score < 0.5:
+                logger.warning(f"反馈验证分数过低 ({validation_score:.2f})，降低权重")
+                feedback_weight *= 0.5
+            
+            if measurement_confidence < 0.3:
+                logger.warning(f"测量置信度过低 ({measurement_confidence:.2f})，降低权重")
+                feedback_weight *= 0.7
+            
+            # 应用权重机制处理反馈
+            if feedback_weight > 0.7:
+                # 高权重反馈，直接应用
+                self._apply_client_feedback(quality_level, bandwidth, rtt, buffer_size, "高权重")
+            elif feedback_weight > 0.4:
+                # 中等权重反馈，需要与本地评估结合
+                local_quality = self.network_quality
+                if self._should_trust_client_feedback(quality_level, local_quality, feedback_weight):
+                    self._apply_client_feedback(quality_level, bandwidth, rtt, buffer_size, "中等权重")
+                else:
+                    logger.info(f"客户端反馈 {quality_level} 与本地评估 {local_quality} 差异过大，使用本地评估")
+            else:
+                # 低权重反馈，仅作参考
+                logger.info(f"客户端反馈权重过低 ({feedback_weight:.2f})，仅作参考")
+                self._log_feedback_reference(quality_level, bandwidth, rtt)
+            
+            # 如果有BBR指标，进行交叉验证
+            if bbr_metrics:
+                self._cross_validate_with_bbr(bbr_metrics, bandwidth, rtt)
+            
+        except (ValueError, IndexError) as e:
+            logger.error(f"解析增强反馈消息时出错: {e}")
+    
+    def _process_traditional_feedback(self, message: str):
+        """
+        处理传统反馈消息 - 新增（向后兼容）
+        
+        Args:
+            message: 传统反馈消息
+        """
+        try:
+            feedback_parts = message.split(":")
+            if len(feedback_parts) >= 2:
+                quality_level = feedback_parts[1].strip()
+                
+                # 解析详细的反馈信息
+                if len(feedback_parts) >= 5:
+                    try:
+                        bandwidth = float(feedback_parts[2])
+                        rtt = float(feedback_parts[3])
+                        buffer_size = int(feedback_parts[4])
+                        
+                        logger.info(f"收到传统网络反馈: 质量={quality_level}, "
+                                  f"带宽={bandwidth/1000000:.2f}Mbps, "
+                                  f"RTT={rtt:.2f}ms, "
+                                  f"缓冲区={buffer_size/1024:.1f}KB")
+                        
+                        # 传统反馈使用默认权重
+                        self._apply_client_feedback(quality_level, bandwidth, rtt, buffer_size, "传统反馈")
+                        
+                    except (ValueError, IndexError):
+                        logger.warning("无法解析详细反馈信息，使用基本质量等级")
+                        if quality_level in NETWORK_QUALITY:
+                            self.network_quality = quality_level
+                            logger.info(f"根据客户端反馈调整网络质量为: {quality_level}")
+        except Exception as e:
+            logger.error(f"处理传统反馈时出错: {e}")
+    
+    def _apply_client_feedback(self, quality_level: str, bandwidth: float, rtt: float, buffer_size: int, feedback_type: str):
+        """
+        应用客户端反馈 - 新增
+        
+        Args:
+            quality_level: 质量等级
+            bandwidth: 带宽
+            rtt: RTT
+            buffer_size: 缓冲区大小
+            feedback_type: 反馈类型
+        """
+        # 根据缓冲区状态调整策略
+        if buffer_size < 256 * 1024:  # 缓冲区不足
+            logger.warning("客户端缓冲区不足，考虑降低质量")
+            # 可以主动降低质量等级
+            if quality_level in NETWORK_QUALITY:
+                quality_levels = list(NETWORK_QUALITY.keys())
+                current_level = quality_levels.index(quality_level)
+                if current_level < len(quality_levels) - 1:
+                    quality_level = quality_levels[current_level + 1]
+                    logger.info(f"主动降低质量到: {quality_level}")
+        
+        if quality_level in NETWORK_QUALITY:
+            self.network_quality = quality_level
+            logger.info(f"根据客户端反馈调整网络质量为: {quality_level} ({feedback_type})")
+            
+            # 如果启用了自适应编码，立即调整编码参数
+            if self.adaptive_encoding_enabled and self.is_streaming:
+                self._adjust_encoding_parameters(quality_level)
+    
+    def _should_trust_client_feedback(self, client_quality: str, local_quality: str, feedback_weight: float) -> bool:
+        """
+        判断是否应该信任客户端反馈 - 新增
+        
+        Args:
+            client_quality: 客户端评估的质量
+            local_quality: 本地评估的质量
+            feedback_weight: 反馈权重
+            
+        Returns:
+            是否应该信任客户端反馈
+        """
+        quality_levels = ["WEAK_GOOD", "WEAK_MEDIUM", "WEAK_POOR", "WEAK_VERY_POOR", "WEAK_CRITICAL"]
+        
+        try:
+            client_index = quality_levels.index(client_quality)
+            local_index = quality_levels.index(local_quality)
+            
+            # 如果差异不超过1个等级，且权重较高，则信任
+            if abs(client_index - local_index) <= 1 and feedback_weight > 0.5:
+                return True
+            
+            # 如果客户端报告质量更差，更容易信任（客户端更能感知用户体验）
+            if client_index > local_index:
+                return True
+            
+            return False
+            
+        except ValueError:
+            logger.error(f"无效的质量等级: {client_quality} 或 {local_quality}")
+            return False
+    
+    def _log_feedback_reference(self, quality_level: str, bandwidth: float, rtt: float):
+        """
+        记录低权重反馈作为参考 - 新增
+        
+        Args:
+            quality_level: 质量等级
+            bandwidth: 带宽
+            rtt: RTT
+        """
+        logger.info(f"客户端反馈参考: 质量={quality_level}, "
+                   f"带宽={bandwidth/1000000:.2f}Mbps, "
+                   f"RTT={rtt:.2f}ms (权重过低，仅作参考)")
+    
+    def _cross_validate_with_bbr(self, client_bbr: dict, client_bandwidth: float, client_rtt: float):
+        """
+        与BBR指标进行交叉验证 - 新增
+        
+        Args:
+            client_bbr: 客户端BBR指标
+            client_bandwidth: 客户端带宽测量
+            client_rtt: 客户端RTT测量
+        """
+        try:
+            # 获取本地BBR指标
+            local_bbr = self.get_bbr_metrics()
+            if not local_bbr:
+                return
+            
+            # 比较带宽测量
+            bandwidth_diff = abs(client_bbr['bandwidth'] - local_bbr.bandwidth)
+            if local_bbr.bandwidth > 0:
+                bandwidth_relative_diff = bandwidth_diff / local_bbr.bandwidth
+                
+                if bandwidth_relative_diff > 0.3:  # 差异超过30%
+                    logger.warning(f"客户端和服务端BBR带宽差异较大: "
+                                 f"客户端={client_bbr['bandwidth']/1000000:.2f}Mbps, "
+                                 f"服务端={local_bbr.bandwidth/1000000:.2f}Mbps")
+            
+            # 比较RTT测量
+            rtt_diff = abs(client_bbr['rtt'] - local_bbr.rtt * 1000)
+            if rtt_diff > 50:  # 差异超过50ms
+                logger.warning(f"客户端和服务端RTT差异较大: "
+                             f"客户端={client_bbr['rtt']:.2f}ms, "
+                             f"服务端={local_bbr.rtt*1000:.2f}ms")
+            
+            # 比较丢包率
+            local_loss_rate = getattr(local_bbr, 'loss_rate', 0.0)
+            loss_rate_diff = abs(client_bbr['loss_rate'] - local_loss_rate)
+            if loss_rate_diff > 0.01:  # 差异超过1%
+                logger.warning(f"客户端和服务端丢包率差异较大: "
+                             f"客户端={client_bbr['loss_rate']*100:.2f}%, "
+                             f"服务端={local_loss_rate*100:.2f}%")
+            
+            logger.debug("BBR指标交叉验证完成")
+            
+        except Exception as e:
+            logger.error(f"BBR交叉验证时出错: {e}")
 
 
 async def analyze_video(input_file):
