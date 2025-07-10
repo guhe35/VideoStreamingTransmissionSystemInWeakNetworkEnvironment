@@ -1030,7 +1030,8 @@ class VideoClient(BBRQuicProtocol):
                     '-autoexit',  # 播放完成后自动退出
                     '-x', '1280',  # 窗口宽度
                     '-y', '720',   # 窗口高度
-                    '-window_title', 'QUIC视频播放器',  # 窗口标题
+                    '-window_title', '弱网场景下的视频流传输系统',  # 窗口标题
+                    '-noborder',  # 无边框
                 ]
                 logger.info("启动FFplay: " + " ".join(cmd))
                 

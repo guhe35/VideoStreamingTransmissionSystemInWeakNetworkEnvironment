@@ -14,9 +14,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel,
                            QComboBox, QProgressBar, QTextEdit, QGroupBox,
                            QSlider, QStyle, QStyleFactory)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QMimeData
-from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QDragEnterEvent, QDropEvent
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QDragEnterEvent, QDropEvent, QPixmap
 from PyQt5.QtChart import QChart, QChartView, QLineSeries, QValueAxis
 import pyqtgraph as pg
+import ctypes
+from ctypes import windll, c_int, byref, sizeof
 
 # 导入服务端和客户端模块
 import sys
@@ -396,6 +398,35 @@ class NetworkMonitorThread(QThread):
 class VideoPlayerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        
+        # 设置Windows标题栏颜色
+        if sys.platform == 'win32':
+            try:
+                # Windows 10/11 深色标题栏
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                set_window_attribute = windll.dwmapi.DwmSetWindowAttribute
+                
+                # 设置深色模式
+                value = c_int(True)
+                set_window_attribute(
+                    int(self.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(value),
+                    sizeof(value)
+                )
+                
+                # 设置标题栏颜色为 #34495E (浅蓝色，与GUI主题匹配)
+                color = c_int(0x00_5E4934)  # BGR format
+                set_window_attribute(
+                    int(self.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(color),
+                    sizeof(color)
+                )
+            except Exception as e:
+                print(f"设置标题栏颜色时出错: {e}")
+        
         self.server_thread = None
         self.client_thread = None
         self.network_monitor_thread = None
@@ -501,13 +532,16 @@ class VideoPlayerGUI(QMainWindow):
 
     def init_ui(self):
         """初始化GUI界面"""
-        self.setWindowTitle('QUIC视频播放器')
+        self.setWindowTitle('弱网场景下的视频流传输系统')
         self.setGeometry(100, 100, 1200, 800)
+        
+        # 设置窗口图标
+        self.setWindowIcon(QIcon('video.png'))
         
         # 设置窗口接受拖放
         self.setAcceptDrops(True)
         
-        # 设置主窗口背景色
+        # 设置主窗口背景色和标题栏样式
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #2C3E50;
@@ -515,6 +549,27 @@ class VideoPlayerGUI(QMainWindow):
             QWidget {
                 background-color: #2C3E50;
                 color: #ECF0F1;
+            }
+            QMenuBar {
+                background-color: #1E3A8A;
+                color: #ECF0F1;
+                border-bottom: 2px solid #3498DB;
+            }
+            QMenuBar::item {
+                background-color: #1E3A8A;
+                color: #ECF0F1;
+            }
+            QMenuBar::item:selected {
+                background-color: #3498DB;
+            }
+            QTitleBar {
+                background-color: #1E3A8A;
+                color: #ECF0F1;
+            }
+            QMainWindow::title {
+                background-color: #1E3A8A;
+                color: #ECF0F1;
+                padding: 5px;
             }
         """)
         
@@ -638,10 +693,11 @@ class VideoPlayerGUI(QMainWindow):
         latency_layout = QVBoxLayout()
         
         self.latency_plot = pg.PlotWidget()
-        self.latency_plot.setBackground('w')
+        self.latency_plot.setBackground('#34495E')
         self.latency_plot.setLabel('left', '延迟 (ms)')
         self.latency_plot.setLabel('bottom', '时间 (s)')
-        self.latency_curve = self.latency_plot.plot(pen='b')
+        # 使用红色(#E74C3C)表示延迟
+        self.latency_curve = self.latency_plot.plot(pen=pg.mkPen(color='#E74C3C', width=2))
         latency_layout.addWidget(self.latency_plot)
         
         latency_group.setLayout(latency_layout)
@@ -652,10 +708,11 @@ class VideoPlayerGUI(QMainWindow):
         packet_loss_layout = QVBoxLayout()
         
         self.packet_loss_plot = pg.PlotWidget()
-        self.packet_loss_plot.setBackground('w')
+        self.packet_loss_plot.setBackground('#34495E')
         self.packet_loss_plot.setLabel('left', '丢包率 (%)')
         self.packet_loss_plot.setLabel('bottom', '时间 (s)')
-        self.packet_loss_curve = self.packet_loss_plot.plot(pen='r')
+        # 使用橙色(#F39C12)表示丢包率
+        self.packet_loss_curve = self.packet_loss_plot.plot(pen=pg.mkPen(color='#F39C12', width=2))
         packet_loss_layout.addWidget(self.packet_loss_plot)
         
         packet_loss_group.setLayout(packet_loss_layout)
@@ -666,11 +723,20 @@ class VideoPlayerGUI(QMainWindow):
         jitter_layout = QVBoxLayout()
         
         self.jitter_plot = pg.PlotWidget()
-        self.jitter_plot.setBackground('w')
+        self.jitter_plot.setBackground('#34495E')
         self.jitter_plot.setLabel('left', '抖动 (ms)')
         self.jitter_plot.setLabel('bottom', '时间 (s)')
-        self.jitter_curve = self.jitter_plot.plot(pen='g')
+        # 使用绿色(#2ECC71)表示抖动
+        self.jitter_curve = self.jitter_plot.plot(pen=pg.mkPen(color='#2ECC71', width=2))
         jitter_layout.addWidget(self.jitter_plot)
+        
+        # 设置图表网格线和样式
+        for plot in [self.latency_plot, self.packet_loss_plot, self.jitter_plot]:
+            plot.showGrid(x=True, y=True, alpha=0.3)
+            plot.getAxis('left').setPen('#ECF0F1')
+            plot.getAxis('bottom').setPen('#ECF0F1')
+            plot.getAxis('left').setTextPen('#ECF0F1')
+            plot.getAxis('bottom').setTextPen('#ECF0F1')
         
         jitter_group.setLayout(jitter_layout)
         right_layout.addWidget(jitter_group)
@@ -698,15 +764,15 @@ class VideoPlayerGUI(QMainWindow):
                 font-family: 'Microsoft YaHei';
                 font-size: 11pt;
                 font-weight: bold;
-                border: 2px solid #3498DB;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 10px;
+                border: 1px solid #3498DB;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 8px;
                 background-color: #34495E;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
+                left: 7px;
                 padding: 0 5px;
                 color: #3498DB;
             }
@@ -723,7 +789,7 @@ class VideoPlayerGUI(QMainWindow):
                 background-color: #2980B9;
             }
             QPushButton:pressed {
-                background-color: #2472A4;
+                background-color: #2573A7;
             }
             QPushButton:disabled {
                 background-color: #7F8C8D;
@@ -734,7 +800,7 @@ class VideoPlayerGUI(QMainWindow):
                 padding: 2px;
             }
             QProgressBar {
-                border: 2px solid #3498DB;
+                border: 1px solid #3498DB;
                 border-radius: 5px;
                 text-align: center;
                 height: 20px;
@@ -751,56 +817,11 @@ class VideoPlayerGUI(QMainWindow):
             QProgressBar::chunk:disabled {
                 background-color: #7F8C8D;
             }
-            
-            /* 图表样式 */
-            QChartView {
-                background-color: #34495E;
-                border-radius: 8px;
-            }
-            
-            /* 滚动条样式 */
-            QScrollBar:vertical {
-                border: none;
-                background-color: #34495E;
-                width: 10px;
-                margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #3498DB;
-                border-radius: 5px;
-                min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #2980B9;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background-color: #34495E;
-            }
-            
-            /* 提示框样式 */
-            QToolTip {
-                background-color: #34495E;
-                color: #ECF0F1;
-                border: 1px solid #3498DB;
-                border-radius: 4px;
-                padding: 4px;
-            }
         """)
         
-        # 设置pyqtgraph样式
+        # 设置pyqtgraph全局样式
         pg.setConfigOption('background', '#34495E')
         pg.setConfigOption('foreground', '#ECF0F1')
-        
-        # 更新图表样式
-        for plot in [self.latency_plot, self.packet_loss_plot, self.jitter_plot]:
-            plot.setBackground('#34495E')
-            plot.getAxis('left').setPen('#ECF0F1')
-            plot.getAxis('bottom').setPen('#ECF0F1')
-            plot.getAxis('left').setTextPen('#ECF0F1')
-            plot.getAxis('bottom').setTextPen('#ECF0F1')
 
     def log(self, message):
         """添加日志消息到日志区域"""
