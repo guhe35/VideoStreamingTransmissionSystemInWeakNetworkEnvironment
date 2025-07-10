@@ -7,11 +7,16 @@ import threading
 import ssl
 import subprocess
 import random
+import json
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, 
                            QVBoxLayout, QHBoxLayout, QWidget, QFileDialog, 
-                           QComboBox, QProgressBar, QTextEdit, QGroupBox)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QFont
+                           QComboBox, QProgressBar, QTextEdit, QGroupBox,
+                           QSlider, QStyle, QStyleFactory)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QMimeData
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QDragEnterEvent, QDropEvent
+from PyQt5.QtChart import QChart, QChartView, QLineSeries, QValueAxis
+import pyqtgraph as pg
 
 # 导入服务端和客户端模块
 import sys
@@ -23,6 +28,7 @@ from client import VideoClient, ALPN_PROTOCOLS
 # 导入网络监控模块
 from bbr_congestion_control import BBRMetrics
 from quic_bbr_integration import BBRNetworkMonitor
+from network_monitor import NetworkQualityMonitor
 
 from aioquic.asyncio import serve, connect
 from aioquic.quic.configuration import QuicConfiguration
@@ -365,12 +371,55 @@ class ClientThread(QThread):
                 logger.error(traceback.format_exc())
 
 
+class NetworkMonitorThread(QThread):
+    metrics_updated = pyqtSignal(object)
+    
+    def __init__(self):
+        super().__init__()
+        self.monitor = NetworkQualityMonitor()
+        self.running = False
+    
+    def run(self):
+        self.running = True
+        self.monitor.start()
+        
+        while self.running:
+            metrics = self.monitor.get_current_metrics()
+            if metrics:
+                self.metrics_updated.emit(metrics)
+            time.sleep(0.5)
+    
+    def stop(self):
+        self.running = False
+        self.monitor.stop()
+
 class VideoPlayerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.server_thread = None
         self.client_thread = None
+        self.network_monitor_thread = None
         self.selected_video_path = None
+        
+        # 初始化状态
+        self.bytes_received = 0
+        self.start_time = time.time()
+        
+        # 初始化数据存储
+        self.latency_data = {'x': [], 'y': []}
+        self.packet_loss_data = {'x': [], 'y': []}
+        self.jitter_data = {'x': [], 'y': []}
+        self.bitrate_data = {'x': [], 'y': []}
+        self.buffer_data = {'x': [], 'y': []}
+        
+        # 播放历史记录
+        self.history_file = "play_history.json"
+        self.play_history = self.load_history()
+        
+        # 设置应用主题
+        self.apply_light_theme()
+        
+        # 初始化UI
         self.init_ui()
         
         # 启动更新定时器
@@ -378,136 +427,381 @@ class VideoPlayerGUI(QMainWindow):
         self.update_timer.timeout.connect(self.update_stats)
         self.update_timer.start(1000)  # 每秒更新一次
         
-        # 初始化状态
-        self.bytes_received = 0
-        self.start_time = time.time()
+        # 初始化网络监控
+        self.network_monitor_thread = NetworkMonitorThread()
+        self.network_monitor_thread.metrics_updated.connect(self.update_network_metrics)
+        self.network_monitor_thread.start()
         
         # 自动启动服务器
-        QTimer.singleShot(500, self.start_server)  # 延迟500毫秒启动服务器，确保UI已完全加载
-    
+        QTimer.singleShot(500, self.start_server)
+
+    def apply_light_theme(self):
+        """应用浅色主题"""
+        self.setStyle(QStyleFactory.create('Fusion'))
+        palette = QPalette()
+        
+        # 设置浅色主题的颜色
+        palette.setColor(QPalette.Window, QColor(240, 240, 240))
+        palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
+        palette.setColor(QPalette.Base, QColor(255, 255, 255))
+        palette.setColor(QPalette.AlternateBase, QColor(245, 245, 245))
+        palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+        palette.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+        palette.setColor(QPalette.Text, QColor(0, 0, 0))
+        palette.setColor(QPalette.Button, QColor(240, 240, 240))
+        palette.setColor(QPalette.ButtonText, QColor(0, 0, 0))
+        palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        
+        self.setPalette(palette)
+
+    def load_history(self):
+        """加载播放历史"""
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return []
+        except Exception as e:
+            logger.error(f"加载播放历史失败: {e}")
+            return []
+
+    def save_history(self):
+        """保存播放历史"""
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.play_history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存播放历史失败: {e}")
+
+    def add_to_history(self, file_path):
+        """添加视频到播放历史"""
+        if not file_path:
+            return
+            
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        history_entry = {
+            "file_path": file_path,
+            "file_name": os.path.basename(file_path),
+            "play_time": current_time
+        }
+        
+        # 移除重复项
+        self.play_history = [h for h in self.play_history if h["file_path"] != file_path]
+        
+        # 添加新记录到开头
+        self.play_history.insert(0, history_entry)
+        
+        # 限制历史记录数量
+        self.play_history = self.play_history[:50]  # 保留最近50条记录
+        
+        # 保存历史记录
+        self.save_history()
+
     def init_ui(self):
+        """初始化GUI界面"""
         self.setWindowTitle('QUIC视频播放器')
-        self.setGeometry(100, 100, 900, 700)
+        self.setGeometry(100, 100, 1200, 800)
+        
+        # 设置窗口接受拖放
+        self.setAcceptDrops(True)
+        
+        # 设置主窗口背景色
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2C3E50;
+            }
+            QWidget {
+                background-color: #2C3E50;
+                color: #ECF0F1;
+            }
+        """)
         
         # 创建主布局
-        main_layout = QVBoxLayout()
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setSpacing(10)  # 增加组件之间的间距
+        main_layout.setContentsMargins(10, 10, 10, 10)  # 设置边距
         
-        # 服务器状态显示（隐藏控制按钮，只显示状态）
+        # 左侧布局
+        left_layout = QVBoxLayout()
+        left_layout.setSpacing(10)  # 增加组件之间的间距
+        
+        # 服务器状态区域
         server_group = QGroupBox("服务器状态")
-        server_layout = QHBoxLayout()
+        server_layout = QVBoxLayout()
         
         self.server_status_label = QLabel("服务器状态: 未启动")
+        self.server_status_label.setFont(QFont("Microsoft YaHei", 9))
         server_layout.addWidget(self.server_status_label)
         
-        # 保留按钮但隐藏它们，以便保持原有功能
-        self.start_server_btn = QPushButton("启动服务器")
-        self.start_server_btn.clicked.connect(self.start_server)
-        self.start_server_btn.hide()
-        
-        self.stop_server_btn = QPushButton("停止服务器")
-        self.stop_server_btn.clicked.connect(self.stop_server)
-        self.stop_server_btn.setEnabled(False)
-        self.stop_server_btn.hide()
-        
-        server_group.setLayout(server_layout)
-        main_layout.addWidget(server_group)
-        
-        # 视频选择区域
-        video_group = QGroupBox("视频选择")
-        video_layout = QHBoxLayout()
-        
-        self.select_video_btn = QPushButton("选择视频文件")
-        self.select_video_btn.clicked.connect(self.select_video)
-        video_layout.addWidget(self.select_video_btn)
-        
-        self.video_path_label = QLabel("未选择视频文件")
-        video_layout.addWidget(self.video_path_label)
-        
-        self.play_video_btn = QPushButton("播放视频")
-        self.play_video_btn.clicked.connect(self.play_video)
-        self.play_video_btn.setEnabled(False)
-        video_layout.addWidget(self.play_video_btn)
-        
-        self.stop_video_btn = QPushButton("停止播放")
-        self.stop_video_btn.clicked.connect(self.stop_video)
-        self.stop_video_btn.setEnabled(False)
-        video_layout.addWidget(self.stop_video_btn)
-        
-        video_group.setLayout(video_layout)
-        main_layout.addWidget(video_group)
-        
-        # 视频信息区域
-        info_group = QGroupBox("传输视频信息")
-        info_layout = QVBoxLayout()
-        
-        self.video_info_label = QLabel("未加载视频")
-        info_layout.addWidget(self.video_info_label)
-        
-        info_group.setLayout(info_layout)
-        main_layout.addWidget(info_group)
-        
-        # 网络状态区域
-        network_group = QGroupBox("网络状态")
-        network_layout = QVBoxLayout()
-        
+        # 添加网络质量和比特率标签
         self.network_quality_label = QLabel("网络质量: -")
-        network_layout.addWidget(self.network_quality_label)
+        self.network_quality_label.setFont(QFont("Microsoft YaHei", 9))
+        server_layout.addWidget(self.network_quality_label)
         
         self.bitrate_label = QLabel("比特率: - Mbps")
-        network_layout.addWidget(self.bitrate_label)
+        self.bitrate_label.setFont(QFont("Microsoft YaHei", 9))
+        server_layout.addWidget(self.bitrate_label)
         
-        self.buffer_label = QLabel("缓冲区: - KB")
-        network_layout.addWidget(self.buffer_label)
+        server_group.setLayout(server_layout)
+        left_layout.addWidget(server_group)
         
-        self.buffer_progress = QProgressBar()
-        self.buffer_progress.setRange(0, 100)
-        self.buffer_progress.setValue(0)
-        network_layout.addWidget(self.buffer_progress)
+        # 区域2：视频控制区
+        control_group = QGroupBox("视频控制")
+        control_layout = QVBoxLayout()
         
-        network_group.setLayout(network_layout)
-        main_layout.addWidget(network_group)
+        # 视频选择按钮
+        self.select_video_btn = QPushButton("选择视频")
+        self.select_video_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        self.select_video_btn.clicked.connect(self.select_video)
+        control_layout.addWidget(self.select_video_btn)
         
-        # 播放状态区域
-        playback_group = QGroupBox("播放状态")
-        playback_layout = QVBoxLayout()
+        # 视频状态标签
+        self.video_status_label = QLabel("当前未选择视频")
+        self.video_status_label.setFont(QFont("Microsoft YaHei", 10))
+        control_layout.addWidget(self.video_status_label)
+        
+        # 播放状态标签
+        self.streaming_status_label = QLabel("流传输: 未开始")
+        self.streaming_status_label.setFont(QFont("Microsoft YaHei", 9))
+        control_layout.addWidget(self.streaming_status_label)
         
         self.playback_status_label = QLabel("播放状态: 未开始")
-        playback_layout.addWidget(self.playback_status_label)
+        self.playback_status_label.setFont(QFont("Microsoft YaHei", 9))
+        control_layout.addWidget(self.playback_status_label)
         
-        self.streaming_status_label = QLabel("流传输: 未开始")
-        playback_layout.addWidget(self.streaming_status_label)
+        # 播放控制按钮
+        button_layout = QHBoxLayout()
+        self.play_video_btn = QPushButton()
+        self.play_video_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.play_video_btn.clicked.connect(self.play_video)
         
-        # 新增缓冲区状态显示
-        self.buffer_progress_label = QLabel("缓冲区状态: 等待中...")
-        playback_layout.addWidget(self.buffer_progress_label)
+        self.stop_video_btn = QPushButton()
+        self.stop_video_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_video_btn.clicked.connect(self.stop_video)
         
-        self.buffer_progress_bar = QProgressBar()
-        self.buffer_progress_bar.setRange(0, 100)
-        self.buffer_progress_bar.setValue(0)
-        playback_layout.addWidget(self.buffer_progress_bar)
+        button_layout.addWidget(self.play_video_btn)
+        button_layout.addWidget(self.stop_video_btn)
+        control_layout.addLayout(button_layout)
         
-        playback_group.setLayout(playback_layout)
-        main_layout.addWidget(playback_group)
+        control_group.setLayout(control_layout)
+        left_layout.addWidget(control_group)
         
-        # 日志区域
-        log_group = QGroupBox("日志")
-        log_layout = QVBoxLayout()
+        # 缓冲区状态显示
+        buffer_group = QGroupBox("缓冲状态")
+        buffer_layout = QVBoxLayout()
         
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
+        self.buffer_progress = QProgressBar()
+        self.buffer_progress.setTextVisible(True)
+        self.buffer_progress.setFormat("缓冲: %p%")
+        self.buffer_progress.setMinimum(0)
+        self.buffer_progress.setMaximum(100)
+        buffer_layout.addWidget(self.buffer_progress)
         
-        log_group.setLayout(log_layout)
-        main_layout.addWidget(log_group)
+        self.buffer_label = QLabel("缓冲区: 0 KB")
+        self.buffer_label.setFont(QFont("Microsoft YaHei", 9))
+        buffer_layout.addWidget(self.buffer_label)
         
-        # 设置主布局
-        central_widget = QWidget()
-        central_widget.setLayout(main_layout)
-        self.setCentralWidget(central_widget)
+        buffer_group.setLayout(buffer_layout)
+        left_layout.addWidget(buffer_group)
         
-        # 初始状态
-        self.update_ui_state()
-    
+        # 区域3：传输视频信息
+        info_group = QGroupBox("视频信息")
+        info_layout = QVBoxLayout()
+        
+        # 使用统一的字体和样式
+        info_font = QFont("Microsoft YaHei", 9)
+        self.resolution_label = QLabel("分辨率")
+        self.codec_label = QLabel("传输编码")
+        self.fps_label = QLabel("帧率")
+        self.audio_codec_label = QLabel("音频编解码器")
+        self.duration_label = QLabel("视频总时长")
+        
+        for label in [self.resolution_label, self.codec_label, self.fps_label, 
+                     self.audio_codec_label, self.duration_label]:
+            label.setFont(info_font)
+            info_layout.addWidget(label)
+        
+        info_group.setLayout(info_layout)
+        left_layout.addWidget(info_group)
+        
+        main_layout.addLayout(left_layout)
+        
+        # 右侧布局（网络监控图表）
+        right_layout = QVBoxLayout()
+        
+        # 区域5：网络延迟图表
+        latency_group = QGroupBox("网络延迟")
+        latency_layout = QVBoxLayout()
+        
+        self.latency_plot = pg.PlotWidget()
+        self.latency_plot.setBackground('w')
+        self.latency_plot.setLabel('left', '延迟 (ms)')
+        self.latency_plot.setLabel('bottom', '时间 (s)')
+        self.latency_curve = self.latency_plot.plot(pen='b')
+        latency_layout.addWidget(self.latency_plot)
+        
+        latency_group.setLayout(latency_layout)
+        right_layout.addWidget(latency_group)
+        
+        # 区域7：丢包率图表
+        packet_loss_group = QGroupBox("丢包率")
+        packet_loss_layout = QVBoxLayout()
+        
+        self.packet_loss_plot = pg.PlotWidget()
+        self.packet_loss_plot.setBackground('w')
+        self.packet_loss_plot.setLabel('left', '丢包率 (%)')
+        self.packet_loss_plot.setLabel('bottom', '时间 (s)')
+        self.packet_loss_curve = self.packet_loss_plot.plot(pen='r')
+        packet_loss_layout.addWidget(self.packet_loss_plot)
+        
+        packet_loss_group.setLayout(packet_loss_layout)
+        right_layout.addWidget(packet_loss_group)
+        
+        # 区域8：网络抖动图表
+        jitter_group = QGroupBox("网络抖动")
+        jitter_layout = QVBoxLayout()
+        
+        self.jitter_plot = pg.PlotWidget()
+        self.jitter_plot.setBackground('w')
+        self.jitter_plot.setLabel('left', '抖动 (ms)')
+        self.jitter_plot.setLabel('bottom', '时间 (s)')
+        self.jitter_curve = self.jitter_plot.plot(pen='g')
+        jitter_layout.addWidget(self.jitter_plot)
+        
+        jitter_group.setLayout(jitter_layout)
+        right_layout.addWidget(jitter_group)
+        
+        main_layout.addLayout(right_layout)
+        
+        # 设置布局比例
+        main_layout.setStretch(0, 1)  # 左侧布局
+        main_layout.setStretch(1, 2)  # 右侧布局
+        
+        # 初始化按钮状态
+        self.play_video_btn.setEnabled(False)
+        self.stop_video_btn.setEnabled(False)
+        
+        # 设置样式
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2C3E50;
+            }
+            QWidget {
+                background-color: #2C3E50;
+                color: #ECF0F1;
+            }
+            QGroupBox {
+                font-family: 'Microsoft YaHei';
+                font-size: 11pt;
+                font-weight: bold;
+                border: 2px solid #3498DB;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+                background-color: #34495E;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #3498DB;
+            }
+            QPushButton {
+                padding: 8px;
+                border-radius: 4px;
+                background-color: #3498DB;
+                color: white;
+                border: none;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #2980B9;
+            }
+            QPushButton:pressed {
+                background-color: #2472A4;
+            }
+            QPushButton:disabled {
+                background-color: #7F8C8D;
+                color: #BDC3C7;
+            }
+            QLabel {
+                color: #ECF0F1;
+                padding: 2px;
+            }
+            QProgressBar {
+                border: 2px solid #3498DB;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+                background-color: #34495E;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #3498DB;
+                border-radius: 3px;
+            }
+            QProgressBar:disabled {
+                border-color: #7F8C8D;
+            }
+            QProgressBar::chunk:disabled {
+                background-color: #7F8C8D;
+            }
+            
+            /* 图表样式 */
+            QChartView {
+                background-color: #34495E;
+                border-radius: 8px;
+            }
+            
+            /* 滚动条样式 */
+            QScrollBar:vertical {
+                border: none;
+                background-color: #34495E;
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #3498DB;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #2980B9;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background-color: #34495E;
+            }
+            
+            /* 提示框样式 */
+            QToolTip {
+                background-color: #34495E;
+                color: #ECF0F1;
+                border: 1px solid #3498DB;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
+        
+        # 设置pyqtgraph样式
+        pg.setConfigOption('background', '#34495E')
+        pg.setConfigOption('foreground', '#ECF0F1')
+        
+        # 更新图表样式
+        for plot in [self.latency_plot, self.packet_loss_plot, self.jitter_plot]:
+            plot.setBackground('#34495E')
+            plot.getAxis('left').setPen('#ECF0F1')
+            plot.getAxis('bottom').setPen('#ECF0F1')
+            plot.getAxis('left').setTextPen('#ECF0F1')
+            plot.getAxis('bottom').setTextPen('#ECF0F1')
+
     def log(self, message):
         """添加日志消息到日志区域"""
         timestamp = time.strftime("%H:%M:%S", time.localtime())
@@ -521,8 +815,6 @@ class VideoPlayerGUI(QMainWindow):
             self.server_thread = ServerThread()
             self.server_thread.server_status.connect(self.update_server_status)
             self.server_thread.start()
-            self.start_server_btn.setEnabled(False)
-            self.stop_server_btn.setEnabled(True)
             self.log("正在启动服务器...")
     
     def stop_server(self):
@@ -530,8 +822,6 @@ class VideoPlayerGUI(QMainWindow):
         if self.server_thread and self.server_thread.running:
             self.server_thread.stop()
             self.log("正在停止服务器...")
-            self.start_server_btn.setEnabled(True)
-            self.stop_server_btn.setEnabled(False)
     
     def update_server_status(self, status):
         """更新服务器状态"""
@@ -550,10 +840,39 @@ class VideoPlayerGUI(QMainWindow):
         
         if file_path:
             self.selected_video_path = file_path
-            self.video_path_label.setText(os.path.basename(file_path))
-            self.log(f"已选择视频文件: {os.path.basename(file_path)}")
-            self.update_ui_state()
+            self.video_status_label.setText(f"当前选择: {os.path.basename(file_path)}")
+            self.play_video_btn.setEnabled(True)
+            
+            # 重置图表数据
+            self.latency_data = {'x': [], 'y': []}
+            self.packet_loss_data = {'x': [], 'y': []}
+            self.jitter_data = {'x': [], 'y': []}
+            
+            # 重置计时器
+            self.start_time = time.time()
     
+    def update_playback_status(self, info):
+        """更新播放状态"""
+        streaming = "已开始" if info['streaming'] else "未开始"
+        self.streaming_status_label.setText(f"流传输: {streaming}")
+        
+        playback = "已开始" if info['playback_started'] else "缓冲中"
+        if info['streaming']:
+            self.playback_status_label.setText(f"播放状态: {playback}")
+        else:
+            self.playback_status_label.setText("播放状态: 未开始")
+        
+        # 更新缓冲区状态显示
+        if 'buffer_size' in info:
+            buffer_size = info['buffer_size']
+            if buffer_size > 0:
+                progress = min(100, (buffer_size / (INITIAL_BUFFER_SIZE)) * 100)
+                self.buffer_progress.setValue(int(progress))
+                self.buffer_label.setText(f"缓冲区: {buffer_size/1024:.1f} KB")
+            else:
+                self.buffer_progress.setValue(0)
+                self.buffer_label.setText("缓冲区: 等待中...")
+
     def play_video(self):
         """播放视频"""
         if not self.selected_video_path:
@@ -563,6 +882,9 @@ class VideoPlayerGUI(QMainWindow):
         if not self.server_thread or not self.server_thread.running:
             self.log("错误: 服务器未启动")
             return
+        
+        # 添加到播放历史
+        self.add_to_history(self.selected_video_path)
         
         # 启动客户端线程
         self.client_thread = ClientThread()
@@ -646,71 +968,122 @@ class VideoPlayerGUI(QMainWindow):
     
     def update_video_info(self, info):
         """更新视频信息"""
-        info_text = f"分辨率: {info['width']}x{info['height']}<br>"
-        info_text += f"传输编码: {info['codec']}<br>"
-        info_text += f"帧率: {info['fps']}fps<br>"
-        info_text += f"音频编解码器: {info['audio_codec']}<br>"
-        info_text += f"时长: {float(info['duration']):.2f}秒"
-        
-        self.video_info_label.setText(info_text)
-        self.log(f"已加载视频信息: {info['width']}x{info['height']}, 传输编码: {info['codec']}, {info['fps']}fps")
+        self.resolution_label.setText(f"分辨率: {info['width']}x{info['height']}")
+        self.codec_label.setText(f"传输编码: {info['codec']}")
+        self.fps_label.setText(f"帧率: {info['fps']}fps")
+        self.audio_codec_label.setText(f"音频编解码器: {info['audio_codec']}")
+        self.duration_label.setText(f"视频总时长: {float(info['duration']):.2f}秒")
     
     def update_network_status(self, info):
-        """更新网络状态 - 改进的实现"""
-        self.bytes_received = info['bytes_received']
-        self.network_quality_label.setText(f"网络质量: {info['quality']}")
-        
-        # 计算比特率
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            bitrate = (self.bytes_received * 8) / (elapsed * 1000000)  # Mbps
-            self.bitrate_label.setText(f"比特率: {bitrate:.2f} Mbps")
-        
-        # 更新缓冲区
-        buffer_size = info['buffer_size'] / 1024  # KB
-        self.buffer_label.setText(f"缓冲区: {buffer_size:.1f} KB")
-        
-        # 更新缓冲区进度条
-        if buffer_size > 0:
-            buffer_percent = min(100, (buffer_size / (INITIAL_BUFFER_SIZE / 1024)) * 100)
-            self.buffer_progress.setValue(int(buffer_percent))
-    
-    def update_playback_status(self, info):
-        """更新播放状态"""
-        streaming = "已开始" if info['streaming'] else "未开始"
-        self.streaming_status_label.setText(f"流传输: {streaming}")
-        
-        playback = "已开始" if info['playback_started'] else "缓冲中"
-        if info['streaming']:
-            self.playback_status_label.setText(f"播放状态: {playback}")
-        else:
-            self.playback_status_label.setText("播放状态: 未开始")
-        
-        # 更新缓冲区状态显示
-        if 'buffer_size' in info:
-            buffer_size = info['buffer_size']
-            if buffer_size > 0:
-                progress = min(100, (buffer_size / (INITIAL_BUFFER_SIZE)) * 100)
-                self.buffer_progress_bar.setValue(int(progress))
-                self.buffer_progress_label.setText(f"缓冲区状态: {buffer_size/1024:.1f} KB ({progress:.1f}%)")
-            else:
-                self.buffer_progress_bar.setValue(0)
-                self.buffer_progress_label.setText("缓冲区状态: 等待中...")
+        """更新网络状态"""
+        try:
+            # 更新网络质量
+            if 'quality' in info:
+                self.network_quality_label.setText(f"网络质量: {info['quality']}")
+            
+            # 更新比特率
+            if 'bytes_received' in info:
+                self.bytes_received = info['bytes_received']
+                elapsed = time.time() - self.start_time
+                if elapsed > 0:
+                    bitrate = (self.bytes_received * 8) / (elapsed * 1000000)  # Mbps
+                    self.bitrate_label.setText(f"比特率: {bitrate:.2f} Mbps")
+            
+            # 更新缓冲区
+            if 'buffer_size' in info:
+                buffer_size = info['buffer_size']
+                buffer_kb = buffer_size / 1024  # 转换为KB
+                self.buffer_label.setText(f"缓冲区: {buffer_kb:.1f} KB")
+                
+                # 更新缓冲区进度条
+                if buffer_size >= 0:
+                    # 计算缓冲区百分比，最大值为初始缓冲区大小
+                    progress = min(100, (buffer_size / INITIAL_BUFFER_SIZE) * 100)
+                    logger.debug(f"缓冲区进度: {progress:.1f}% (buffer_size={buffer_size}, INITIAL_BUFFER_SIZE={INITIAL_BUFFER_SIZE})")
+                    self.buffer_progress.setValue(int(progress))
+                else:
+                    self.buffer_progress.setValue(0)
+                    self.buffer_label.setText("缓冲区: 等待中...")
+        except Exception as e:
+            logger.error(f"更新网络状态时出错: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def update_stats(self):
-        """定期更新统计信息 - 改进的实现"""
-        # 如果有活跃的客户端连接，更新网络状态
+        """定期更新统计信息"""
         if self.client_thread and self.client_thread.running and self.client_thread.client_protocol:
             client = self.client_thread.client_protocol
+            current_time = time.time() - self.start_time
             
-            # 确保即使没有新的数据包到达，也能更新网络状态显示
-            if hasattr(client, 'total_bytes_received') and hasattr(client, 'network_quality'):
-                network_info = {
-                    'bytes_received': client.total_bytes_received,
-                    'quality': client.network_quality,
-                    'buffer_size': getattr(client, 'buffer_size', 0)
-                }
-                self.update_network_status(network_info)
+            if hasattr(client, 'total_bytes_received'):
+                self.bytes_received = client.total_bytes_received
+                bitrate = (self.bytes_received * 8) / (1000000 * max(1, current_time))  # Mbps
+                
+                self.bitrate_data['x'].append(current_time)
+                self.bitrate_data['y'].append(bitrate)
+                
+                if len(self.bitrate_data['x']) > 60:
+                    self.bitrate_data['x'] = self.bitrate_data['x'][-60:]
+                    self.bitrate_data['y'] = self.bitrate_data['y'][-60:]
+                
+                self.bitrate_curve.setData(self.bitrate_data['x'], self.bitrate_data['y'])
+            
+            if hasattr(client, 'buffer_size'):
+                self.buffer_size = client.buffer_size
+                buffer_kb = self.buffer_size / 1024  # KB
+                
+                self.buffer_data['x'].append(current_time)
+                self.buffer_data['y'].append(buffer_kb)
+                
+                if len(self.buffer_data['x']) > 60:
+                    self.buffer_data['x'] = self.buffer_data['x'][-60:]
+                    self.buffer_data['y'] = self.buffer_data['y'][-60:]
+                
+                self.buffer_curve.setData(self.buffer_data['x'], self.buffer_data['y'])
+    
+    def update_network_metrics(self, metrics):
+        """更新网络质量指标显示"""
+        if not hasattr(self, 'latency_data'):
+            # 如果数据存储未初始化，则初始化它们
+            self.latency_data = {'x': [], 'y': []}
+            self.packet_loss_data = {'x': [], 'y': []}
+            self.jitter_data = {'x': [], 'y': []}
+        
+        current_time = time.time() - self.start_time
+        
+        # 更新网络延迟图表
+        if metrics.latency >= 0:
+            self.latency_data['x'].append(current_time)
+            self.latency_data['y'].append(metrics.latency)
+            
+            # 保持最近60秒的数据
+            if len(self.latency_data['x']) > 60:
+                self.latency_data['x'] = self.latency_data['x'][-60:]
+                self.latency_data['y'] = self.latency_data['y'][-60:]
+            
+            self.latency_curve.setData(self.latency_data['x'], self.latency_data['y'])
+        
+        # 更新丢包率图表
+        self.packet_loss_data['x'].append(current_time)
+        self.packet_loss_data['y'].append(metrics.packet_loss)
+        
+        # 保持最近60秒的数据
+        if len(self.packet_loss_data['x']) > 60:
+            self.packet_loss_data['x'] = self.packet_loss_data['x'][-60:]
+            self.packet_loss_data['y'] = self.packet_loss_data['y'][-60:]
+        
+        self.packet_loss_curve.setData(self.packet_loss_data['x'], self.packet_loss_data['y'])
+        
+        # 更新网络抖动图表
+        self.jitter_data['x'].append(current_time)
+        self.jitter_data['y'].append(metrics.jitter)
+        
+        # 保持最近60秒的数据
+        if len(self.jitter_data['x']) > 60:
+            self.jitter_data['x'] = self.jitter_data['x'][-60:]
+            self.jitter_data['y'] = self.jitter_data['y'][-60:]
+        
+        self.jitter_curve.setData(self.jitter_data['x'], self.jitter_data['y'])
     
     def update_ui_state(self):
         """更新UI状态"""
@@ -770,6 +1143,11 @@ class VideoPlayerGUI(QMainWindow):
                     self.server_thread.terminate()
                     self.server_thread.wait(1000)
             
+            # 停止网络监控线程
+            if self.network_monitor_thread:
+                self.network_monitor_thread.stop()
+                self.network_monitor_thread.wait()
+            
             logger.info("应用程序关闭完成")
             
         except Exception as e:
@@ -778,6 +1156,24 @@ class VideoPlayerGUI(QMainWindow):
             logger.error(traceback.format_exc())
         
         event.accept()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """处理拖入事件"""
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv')):
+                    event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        """处理放下事件"""
+        url = event.mimeData().urls()[0]
+        file_path = url.toLocalFile()
+        self.selected_video_path = file_path
+        self.video_status_label.setText(f"当前选择: {os.path.basename(file_path)}")
+        self.play_video_btn.setEnabled(True)
+        event.acceptProposedAction()
 
 
 if __name__ == "__main__":
