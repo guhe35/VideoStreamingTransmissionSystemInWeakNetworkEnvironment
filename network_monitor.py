@@ -15,6 +15,7 @@ class NetworkMetrics:
     latency: float  # 毫秒
     packet_loss: float  # 百分比 (0-100)
     jitter: float  # 毫秒
+    bandwidth: float  # 带宽 (bytes/second)
 
 class NetworkQualityMonitor:
     def __init__(self, target_host: str = "127.0.0.1", target_port: int = 12345, 
@@ -46,6 +47,10 @@ class NetworkQualityMonitor:
         
         # 用于计算抖动的上一次延迟值
         self.last_latency = None
+        
+        # 带宽测量相关
+        self.bandwidth_samples = []
+        self.max_bandwidth_samples = 10
         
         # 启动UDP服务器（如果监控本地网络）
         self.server_socket = None
@@ -108,6 +113,45 @@ class NetworkQualityMonitor:
                 logger.error(f"UDP测量出错: {e}")
             return float('inf'), False
     
+    def _measure_bandwidth(self) -> float:
+        """
+        测量网络带宽
+        
+        Returns:
+            带宽 (bytes/second)
+        """
+        try:
+            import psutil
+            
+            # 获取网络IO统计信息
+            net_io_counters = psutil.net_io_counters()
+            bytes_recv = net_io_counters.bytes_recv
+            
+            # 等待一小段时间
+            time.sleep(0.5)
+            
+            # 再次获取统计信息
+            net_io_counters = psutil.net_io_counters()
+            bytes_recv_new = net_io_counters.bytes_recv
+            
+            # 计算每秒字节数
+            bytes_per_sec = (bytes_recv_new - bytes_recv) * 2  # 乘以2转换为每秒
+            
+            # 更新带宽样本
+            self.bandwidth_samples.append(bytes_per_sec)
+            if len(self.bandwidth_samples) > self.max_bandwidth_samples:
+                self.bandwidth_samples.pop(0)
+            
+            # 返回平均带宽
+            return sum(self.bandwidth_samples) / len(self.bandwidth_samples)
+            
+        except ImportError:
+            logger.warning("psutil未安装，无法测量带宽")
+            return 1000000  # 默认1Mbps
+        except Exception as e:
+            logger.error(f"测量带宽时出错: {e}")
+            return 1000000  # 默认1Mbps
+    
     def start(self):
         """启动网络质量监控"""
         if not self.running:
@@ -165,12 +209,16 @@ class NetworkQualityMonitor:
                     jitter = abs(avg_latency - self.last_latency)
                 self.last_latency = avg_latency if avg_latency != float('inf') else self.last_latency
                 
+                # 测量带宽
+                bandwidth = self._measure_bandwidth()
+                
                 # 创建新的度量记录
                 metrics = NetworkMetrics(
                     timestamp=time.time(),
                     latency=avg_latency if avg_latency != float('inf') else -1,
                     packet_loss=packet_loss,
-                    jitter=jitter
+                    jitter=jitter,
+                    bandwidth=bandwidth
                 )
                 
                 # 更新历史数据
@@ -184,6 +232,49 @@ class NetworkQualityMonitor:
             
             # 等待下一次测量
             time.sleep(self.interval)
+    
+    def _estimate_bandwidth(self, latency: float, packet_loss: float) -> float:
+        """
+        基于延迟和丢包率估算带宽
+        
+        Args:
+            latency: 延迟 (毫秒)
+            packet_loss: 丢包率 (百分比)
+            
+        Returns:
+            估算的带宽 (bytes/second)
+        """
+        if latency == float('inf') or latency <= 0:
+            return 1000000  # 默认1Mbps
+        
+        # 基于延迟估算带宽
+        # 延迟越低，带宽可能越高
+        if latency <= 20:
+            base_bandwidth = 15000000  # 15Mbps
+        elif latency <= 50:
+            base_bandwidth = 8000000   # 8Mbps
+        elif latency <= 100:
+            base_bandwidth = 4000000   # 4Mbps
+        elif latency <= 200:
+            base_bandwidth = 2000000   # 2Mbps
+        elif latency <= 500:
+            base_bandwidth = 1000000   # 1Mbps
+        else:
+            base_bandwidth = 500000    # 500Kbps
+        
+        # 根据丢包率调整带宽
+        if packet_loss <= 1.0:
+            bandwidth_factor = 1.0
+        elif packet_loss <= 3.0:
+            bandwidth_factor = 0.8
+        elif packet_loss <= 5.0:
+            bandwidth_factor = 0.6
+        elif packet_loss <= 10.0:
+            bandwidth_factor = 0.4
+        else:
+            bandwidth_factor = 0.2
+        
+        return base_bandwidth * bandwidth_factor
     
     def get_current_metrics(self) -> Optional[NetworkMetrics]:
         """获取当前网络质量指标"""

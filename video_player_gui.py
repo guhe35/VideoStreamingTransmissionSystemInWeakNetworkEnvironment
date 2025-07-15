@@ -31,6 +31,8 @@ from client import VideoClient, ALPN_PROTOCOLS
 from bbr_congestion_control import BBRMetrics
 from quic_bbr_integration import BBRNetworkMonitor
 from network_monitor import NetworkQualityMonitor
+from network_quality_config import get_network_quality_levels, get_network_quality_config
+from network_quality_evaluator import evaluate_network_quality
 
 from aioquic.asyncio import serve, connect
 from aioquic.quic.configuration import QuicConfiguration
@@ -215,13 +217,27 @@ class ClientThread(QThread):
                     def periodic_network_update(self):
                         """定期更新网络指标 - 改进的实现"""
                         try:
-                            # 获取算法指标（后台使用，不显示在GUI）
+                            # 获取BBR指标（后台使用，不显示在GUI）
                             bbr_metrics = self.get_bbr_metrics()
                             
-                            # 发送网络状态到GUI
+                            # 获取当前网络监控指标
+                            current_metrics = None
+                            if hasattr(self, 'network_monitor'):
+                                current_metrics = self.network_monitor.get_current_metrics()
+                            
+                            # 计算真实的网络质量等级
+                            real_quality = 'UNKNOWN'
+                            if current_metrics:
+                                # 使用与客户端相同的质量判断逻辑
+                                real_quality = self._determine_quality_from_network_metrics(current_metrics)
+                            else:
+                                # 如果没有监控数据，使用缓存的网络质量
+                                real_quality = getattr(self, 'network_quality', 'UNKNOWN')
+                            
+                            # 发送网络状态到GUI - 只包含质量等级
                             network_info = {
                                 'bytes_received': getattr(self, 'total_bytes_received', 0),
-                                'quality': getattr(self, 'network_quality', 'UNKNOWN'),
+                                'quality': real_quality,  # 使用真实的网络质量
                                 'buffer_size': getattr(self, 'buffer_size', 0)
                             }
                             self.parent_thread.network_status.emit(network_info)
@@ -243,6 +259,27 @@ class ClientThread(QThread):
                             import traceback
                             logger.error(traceback.format_exc())
                     
+                    def _determine_quality_from_network_metrics(self, metrics):
+                        """
+                        根据NetworkMonitor指标确定网络质量 - 使用统一的评估函数
+        
+                        Args:
+                            metrics: NetworkMonitor网络指标
+            
+                        Returns:
+                            网络质量等级
+                        """
+                        # 使用统一的网络质量评估函数
+                        quality = evaluate_network_quality(metrics)
+                        
+                        logger.info(f"GUI网络质量评估结果: {quality} "
+                                   f"(延迟: {metrics.latency:.1f}ms, "
+                                   f"丢包率: {metrics.packet_loss:.2f}%, "
+                                   f"抖动: {metrics.jitter:.1f}ms, "
+                                   f"带宽: {metrics.bandwidth/1000000:.2f}Mbps)")
+                        
+                        return quality
+                
                     def quic_event_received(self, event):
                         if isinstance(event, StreamDataReceived):
                             data = event.data
@@ -302,10 +339,24 @@ class ClientThread(QThread):
                         
                         # 更新网络状态
                         if hasattr(client, 'total_bytes_received') and hasattr(client, 'network_quality'):
-                            # 获取QUIC连接统计信息
+                            # 获取当前网络监控指标
+                            current_metrics = None
+                            if hasattr(client, 'network_monitor'):
+                                current_metrics = client.network_monitor.get_current_metrics()
+                            
+                            # 计算真实的网络质量等级
+                            real_quality = 'UNKNOWN'
+                            if current_metrics and hasattr(client, '_determine_quality_from_network_metrics'):
+                                # 使用改进的质量判断逻辑
+                                real_quality = client._determine_quality_from_network_metrics(current_metrics)
+                            else:
+                                # 如果没有监控数据，使用缓存的网络质量
+                                real_quality = getattr(client, 'network_quality', 'UNKNOWN')
+                            
+                            # 发送网络状态到GUI - 只包含质量等级
                             network_info = {
                                 'bytes_received': client.total_bytes_received,
-                                'quality': client.network_quality,
+                                'quality': real_quality,  # 使用真实的网络质量
                                 'buffer_size': getattr(client, 'buffer_size', 0)
                             }
                             self.network_status.emit(network_info)
@@ -996,11 +1047,12 @@ class VideoPlayerGUI(QMainWindow):
         self.duration_label.setText(f"视频总时长: {float(info['duration']):.2f}秒")
     
     def update_network_status(self, info):
-        """更新网络状态"""
+        """更新网络状态 - 只显示网络质量等级"""
         try:
-            # 更新网络质量
+            # 只显示网络质量等级
             if 'quality' in info:
-                self.network_quality_label.setText(f"网络质量: {info['quality']}")
+                quality_text = f"网络质量: {info['quality']}"
+                self.network_quality_label.setText(quality_text)
             
             # 更新比特率
             if 'bytes_received' in info:
@@ -1128,12 +1180,12 @@ class VideoPlayerGUI(QMainWindow):
                 self.client_thread.stop()
                 
                 # 等待客户端线程结束
-                if self.client_thread.wait(3000):
+                if self.client_thread.wait(5000):  # 增加等待时间到5秒
                     logger.info("客户端线程已停止")
                 else:
-                    logger.warning("客户端线程未能在3秒内停止，强制终止")
+                    logger.warning("客户端线程未能在5秒内停止，强制终止")
                     self.client_thread.terminate()
-                    self.client_thread.wait(1000)
+                    self.client_thread.wait(2000)  # 再等待2秒
                 
                 # 确保FFplay进程被关闭
                 if hasattr(self.client_thread, 'client_protocol') and self.client_thread.client_protocol:
@@ -1143,7 +1195,7 @@ class VideoPlayerGUI(QMainWindow):
                             if client.ffplay_process.poll() is None:
                                 logger.info("正在关闭FFplay进程...")
                                 client.ffplay_process.terminate()
-                                client.ffplay_process.wait(timeout=2)
+                                client.ffplay_process.wait(timeout=3)  # 增加超时时间
                         except:
                             try:
                                 if client.ffplay_process:
@@ -1157,17 +1209,21 @@ class VideoPlayerGUI(QMainWindow):
                 self.server_thread.stop()
                 
                 # 等待服务器线程结束
-                if self.server_thread.wait(3000):
+                if self.server_thread.wait(5000):  # 增加等待时间到5秒
                     logger.info("服务器线程已停止")
                 else:
-                    logger.warning("服务器线程未能在3秒内停止，强制终止")
+                    logger.warning("服务器线程未能在5秒内停止，强制终止")
                     self.server_thread.terminate()
-                    self.server_thread.wait(1000)
+                    self.server_thread.wait(2000)  # 再等待2秒
             
             # 停止网络监控线程
             if self.network_monitor_thread:
+                logger.info("正在停止网络监控线程...")
                 self.network_monitor_thread.stop()
-                self.network_monitor_thread.wait()
+                if self.network_monitor_thread.wait(3000):  # 等待3秒
+                    logger.info("网络监控线程已停止")
+                else:
+                    logger.warning("网络监控线程未能在3秒内停止")
             
             logger.info("应用程序关闭完成")
             
